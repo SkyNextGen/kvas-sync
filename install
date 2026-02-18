@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+# ===== FIXED GITHUB =====
 ORG="SkyNextGen"
 REPO="kvas-sync"
 BRANCH="main"
@@ -57,20 +58,16 @@ head -c 2 "$ARCHIVE" | grep -q "PK" || { say "❌ Скачанное не пох
 say "Распаковка архива..."
 unzip -qo "$ARCHIVE" -d "$WORK"
 
-# ---- НАДЕЖНО: ищем сам файл payload/bin/kvas-sync.sh где угодно ----
+# ---- Надёжно ищем payload/bin/kvas-sync.sh где угодно ----
 KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit 2>/dev/null || true)"
 if [ -z "$KS_PATH" ]; then
   say "❌ Не найден payload/bin/kvas-sync.sh в распакованном архиве"
-  say "ℹ️ Диагностика (топ-уровень):"
-  find "$WORK" -maxdepth 3 -type d | head -n 50 >&2
+  say "ℹ️ Диагностика (каталоги, maxdepth=4):"
+  find "$WORK" -maxdepth 4 -type d | head -n 80 >&2
   exit 1
 fi
 
-# KS_PATH = .../<repo-root>/payload/bin/kvas-sync.sh
-PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"         # .../<repo-root>/payload
-REPO_ROOT="$(dirname "$PAYLOAD_DIR")"                    # .../<repo-root>
-
-# sanity: должны существовать payload/bin и payload/conf
+PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"  # .../payload
 [ -d "$PAYLOAD_DIR/bin" ]  || { say "❌ Нет $PAYLOAD_DIR/bin"; exit 1; }
 [ -d "$PAYLOAD_DIR/conf" ] || { say "❌ Нет $PAYLOAD_DIR/conf"; exit 1; }
 
@@ -92,8 +89,8 @@ BOT_TOKEN="$(ask "Токен бота" "")"
 CHAT_ID="$(ask "ID чата" "")"
 ROUTER_NAME="$(ask "Имя роутера (на русском)" "Keenetic-1")"
 
-[ -n "$BOT_TOKEN" ] || { say "❌ Пустой токен"; exit 1; }
-[ -n "$CHAT_ID" ]   || { say "❌ Пустой ID чата"; exit 1; }
+[ -n "$BOT_TOKEN" ]   || { say "❌ Пустой токен"; exit 1; }
+[ -n "$CHAT_ID" ]     || { say "❌ Пустой ID чата"; exit 1; }
 [ -n "$ROUTER_NAME" ] || { say "❌ Пустое имя"; exit 1; }
 
 umask 077
@@ -103,19 +100,14 @@ CHAT_ID="$CHAT_ID"
 EOF
 chmod 600 "$BASE/conf/secrets.conf"
 
-# device.conf из device.example.conf, если есть
-if [ -f "$BASE/conf/device.example.conf" ]; then
-  cp "$BASE/conf/device.example.conf" "$BASE/conf/device.conf"
-  if grep -q '^ROUTER_NAME=' "$BASE/conf/device.conf" 2>/dev/null; then
-    sed -i "s/^ROUTER_NAME=.*/ROUTER_NAME=\"$ROUTER_NAME\"/" "$BASE/conf/device.conf" || true
-  else
-    printf '\nROUTER_NAME="%s"\n' "$ROUTER_NAME" >> "$BASE/conf/device.conf"
-  fi
-else
-  cat > "$BASE/conf/device.conf" <<EOF
+# ✅ ВАЖНО: создаём device.conf без sed (чтобы / & \ не ломали запись)
+cat > "$BASE/conf/device.conf" <<EOF
+# ===== DEVICE SETTINGS =====
 ROUTER_NAME="$ROUTER_NAME"
+
+# Команда импорта KVAS. Скрипт сам передаст путь к списку.
+IMPORT_CMD="kvas import"
 EOF
-fi
 chmod 644 "$BASE/conf/device.conf"
 
 # cron
