@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# =========================
+# KVAS-SYNC Router Agent
+# =========================
+
 COMMON="/opt/kvas-sync/conf/common.conf"
 DEVICE="/opt/kvas-sync/conf/device.conf"
 SECRETS="/opt/kvas-sync/conf/secrets.conf"
@@ -9,6 +13,7 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 [ -f "$DEVICE" ] && . "$DEVICE"
 [ -f "$SECRETS" ] && . "$SECRETS"
 
+# ----- Defaults -----
 : "${WORKDIR:=/opt/kvas-sync}"
 : "${STATE_DIR:=$WORKDIR/state}"
 : "${LOG_FILE:=$WORKDIR/log/kvas-sync.log}"
@@ -26,6 +31,7 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 
 : "${IMPORT_TIMEOUT:=2700}"
 
+# ----- Files -----
 mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp"
 
 LOCK_DIR="$STATE_DIR/import.lock"
@@ -38,32 +44,13 @@ TPL_OK="$WORKDIR/conf/tg_ok.tpl"
 TPL_SAME="$WORKDIR/conf/tg_same.tpl"
 TPL_ERR="$WORKDIR/conf/tg_err.tpl"
 
+# ----- Utils -----
 ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
 log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
 
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
-
-# ===== TELEGRAM (with response logging) =====
-tg_send() {
-  msg="$1"
-
-  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-    log "TG: skip (no token/chat_id)"
-    return 0
-  fi
-
-  resp="$(curl -sS -m 20 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${CHAT_ID}" \
-    --data-urlencode "text=${msg}" 2>&1)" || {
-      log "TG: send failed: $resp"
-      return 0
-    }
-
-  echo "$resp" | grep -q '"ok":true' || log "TG: api error: $resp"
-  return 0
-}
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -85,16 +72,38 @@ download_with_retry() {
   n=1
   while [ "$n" -le "$RETRY_COUNT" ]; do
     curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
-
     if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
       return 0
     fi
-
     log "download retry $n/$RETRY_COUNT failed"
     n=$((n+1))
     sleep "$RETRY_DELAY"
   done
   return 1
+}
+
+# ----- Telegram (production with delay) -----
+tg_send() {
+  msg="$1"
+
+  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+    log "TG: skip (no token/chat_id)"
+    return 0
+  fi
+
+  # ⏳ Даем сети и DNS стабилизироваться (важно при чистой установке)
+  sleep 10
+
+  resp="$(curl -sS -m 20 -X POST \
+    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${msg}" 2>&1)" || {
+      log "TG: send failed: $resp"
+      return 0
+    }
+
+  echo "$resp" | grep -q '"ok":true' || log "TG: api error: $resp"
+  return 0
 }
 
 render_and_send() {
@@ -124,7 +133,10 @@ render_and_send() {
   tg_send "$(cat "$tmp")"
 }
 
-# ===== MAIN =====
+# =========================
+# MAIN
+# =========================
+
 [ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
 
 mkdir "$LOCK_DIR" 2>/dev/null || exit 0
@@ -138,7 +150,7 @@ rm -f "$NEW_RAW" "$NEW_NORM"
 if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
   log "download failed"
   ERR_TITLE="Ошибка загрузки"
-  ERR_LINES="• —"
+  ERR_LINES="• download failed"
   render_and_send "$TPL_ERR"
   exit 1
 fi
@@ -160,7 +172,7 @@ SHA_SHOW="$(sha_show4 "$SHA")"
 if [ "$LINES" -lt "$MIN_LINES" ] || [ "$LINES" -gt "$MAX_LINES" ]; then
   log "lines out of bounds: $LINES"
   ERR_TITLE="Некорректный размер списка"
-  ERR_LINES="• строк: $LINES (ожидалось $MIN_LINES..$MAX_LINES)"
+  ERR_LINES="• строк: $LINES"
   render_and_send "$TPL_ERR"
   exit 1
 fi
