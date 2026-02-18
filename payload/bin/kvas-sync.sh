@@ -1,7 +1,6 @@
 #!/bin/sh
 set -eu
 
-# ===== CONFIG FILES =====
 COMMON="/opt/kvas-sync/conf/common.conf"
 DEVICE="/opt/kvas-sync/conf/device.conf"
 SECRETS="/opt/kvas-sync/conf/secrets.conf"
@@ -10,7 +9,6 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 [ -f "$DEVICE" ] && . "$DEVICE"
 [ -f "$SECRETS" ] && . "$SECRETS"
 
-# ===== DEFAULTS =====
 : "${WORKDIR:=/opt/kvas-sync}"
 : "${STATE_DIR:=$WORKDIR/state}"
 : "${LOG_FILE:=$WORKDIR/log/kvas-sync.log}"
@@ -45,10 +43,9 @@ dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
 log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
 
-# экранирование для sed replacement: \ / &
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
-# ===== TELEGRAM =====
+# ===== TELEGRAM (with response logging) =====
 tg_send() {
   msg="$1"
 
@@ -57,10 +54,15 @@ tg_send() {
     return 0
   fi
 
-  curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  resp="$(curl -sS -m 20 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
     -d "chat_id=${CHAT_ID}" \
-    --data-urlencode "text=${msg}" \
-    >/dev/null 2>&1 || log "TG: send failed"
+    --data-urlencode "text=${msg}" 2>&1)" || {
+      log "TG: send failed: $resp"
+      return 0
+    }
+
+  echo "$resp" | grep -q '"ok":true' || log "TG: api error: $resp"
+  return 0
 }
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
@@ -82,12 +84,12 @@ download_with_retry() {
   url="$1"; out="$2"
   n=1
   while [ "$n" -le "$RETRY_COUNT" ]; do
-    # ping
     curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
 
     if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
       return 0
     fi
+
     log "download retry $n/$RETRY_COUNT failed"
     n=$((n+1))
     sleep "$RETRY_DELAY"
@@ -107,8 +109,6 @@ render_and_send() {
   L_ESC="$(esc_sed "$LINES")"
   S_ESC="$(esc_sed "$SHA_SHOW")"
   D_ESC="$(esc_sed "$DT")"
-
-  # ERR vars might be unused in ok/same templates but keep harmless
   E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
   E2_ESC="$(esc_sed "${ERR_LINES:-}")"
 
@@ -143,7 +143,6 @@ if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
   exit 1
 fi
 
-# HTML check
 head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
   log "download returned HTML"
   ERR_TITLE="Ошибка загрузки"
@@ -178,7 +177,6 @@ if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
   exit 0
 fi
 
-# ===== IMPORT =====
 if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
   cp "$NEW_NORM" "$CUR_FILE"
   log "IMPORT OK"
