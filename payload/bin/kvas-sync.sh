@@ -1,203 +1,215 @@
 #!/bin/sh
 set -eu
 
-# =========================
-# KVAS-SYNC Router Agent
-# =========================
+# ===== Repo defaults =====
+ORG="SkyNextGen"
+REPO="kvas-sync"
+BRANCH="main"
 
-COMMON="/opt/kvas-sync/conf/common.conf"
-DEVICE="/opt/kvas-sync/conf/device.conf"
-SECRETS="/opt/kvas-sync/conf/secrets.conf"
+BASE="/opt/kvas-sync"
+TMPROOT="/opt/tmp"
+WORK="${TMPROOT}/kvas-sync-install.$$"
+ARCHIVE="${TMPROOT}/kvas-sync-${BRANCH}.zip"
 
-[ -f "$COMMON" ] && . "$COMMON"
-[ -f "$DEVICE" ] && . "$DEVICE"
-[ -f "$SECRETS" ] && . "$SECRETS"
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+say() { echo "$*" >&2; }
 
-# ----- Defaults -----
-: "${WORKDIR:=/opt/kvas-sync}"
-: "${STATE_DIR:=$WORKDIR/state}"
-: "${LOG_FILE:=$WORKDIR/log/kvas-sync.log}"
-: "${LIST_URL:=}"
-: "${ROUTER_NAME:=Router}"
-: "${IMPORT_CMD:=kvas import}"
-
-: "${MIN_LINES:=200}"
-: "${MAX_LINES:=3500}"
-
-: "${CURL_TIMEOUT:=25}"
-: "${PING_URL:=https://raw.githubusercontent.com/}"
-: "${RETRY_COUNT:=3}"
-: "${RETRY_DELAY:=8}"
-
-: "${IMPORT_TIMEOUT:=2700}"
-
-# ----- Files -----
-mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp"
-
-LOCK_DIR="$STATE_DIR/import.lock"
-
-NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
-NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
-CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
-
-TPL_OK="$WORKDIR/conf/tg_ok.tpl"
-TPL_SAME="$WORKDIR/conf/tg_same.tpl"
-TPL_ERR="$WORKDIR/conf/tg_err.tpl"
-
-# ----- Utils -----
-ts()    { date '+%Y-%m-%d %H:%M:%S'; }
-dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
-
-log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
-
-esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
-
-sha_full() { sha256sum "$1" | awk '{print $1}'; }
-
-sha_show4() {
-  h="$1"
-  printf "%s…%s" "$(printf '%s' "$h" | cut -c1-4)" "$(printf '%s' "$h" | cut -c61-64)"
+ask() {
+  # visible input (token is visible as requested)
+  printf "%s: " "$1" >&2
+  IFS= read -r ans || true
+  printf "%s" "$ans"
 }
 
-normalize_list() {
-  in="$1"; out="$2"
-  sed 's/\r$//' "$in" \
-    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-    | sed '/^$/d' \
-    | sort -u > "$out"
-}
+cleanup() { rm -rf "$WORK" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
-download_with_retry() {
-  url="$1"; out="$2"
-  n=1
-  while [ "$n" -le "$RETRY_COUNT" ]; do
-    curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
-    if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
-      return 0
-    fi
-    log "download retry $n/$RETRY_COUNT failed"
-    n=$((n+1))
-    sleep "$RETRY_DELAY"
+install_pkgs() {
+  # Usage: install_pkgs pkg1 pkg2 ...
+  for p in "$@"; do
+    opkg install "$p" >/dev/null 2>&1 || true
   done
-  return 1
 }
 
-# ----- Telegram (production with delay) -----
-tg_send() {
-  msg="$1"
-
-  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-    log "TG: skip (no token/chat_id)"
-    return 0
+ensure_deps() {
+  if ! need_cmd opkg; then
+    say "❌ Entware (opkg) не найден. Установите Entware и убедитесь, что /opt смонтирован."
+    exit 1
   fi
 
-  # ⏳ Даем сети и DNS стабилизироваться (важно при чистой установке)
-  sleep 10
+  say "Проверка зависимостей Entware..."
+  opkg update >/dev/null 2>&1 || true
 
-  resp="$(curl -sS -m 20 -X POST \
-    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${CHAT_ID}" \
-    --data-urlencode "text=${msg}" 2>&1)" || {
-      log "TG: send failed: $resp"
-      return 0
-    }
+  # Base deps
+  install_pkgs curl ca-bundle unzip coreutils-timeout
 
-  echo "$resp" | grep -q '"ok":true' || log "TG: api error: $resp"
-  return 0
+  # cron package name differs across feeds; try common variants
+  install_pkgs cron vixie-cron cronie
+
+  # find is usually in BusyBox, but ensure it's available
+  if ! need_cmd find; then
+    install_pkgs findutils
+  fi
+
+  # Hard checks
+  need_cmd curl  || { say "❌ Не найден curl (/opt/bin/curl)."; exit 1; }
+  need_cmd unzip || { say "❌ Не найден unzip."; exit 1; }
+  need_cmd timeout || { say "❌ Не найден timeout (coreutils-timeout)."; exit 1; }
+  need_cmd crontab || { say "❌ Не найден crontab (пакет cron/vixie-cron)."; exit 1; }
+
+  # crond may be /opt/sbin/crond; check explicitly
+  if [ ! -x /opt/sbin/crond ] && ! need_cmd crond; then
+    say "❌ Не найден crond (демон cron). Проверьте пакет cron/vixie-cron."
+    exit 1
+  fi
 }
 
-render_and_send() {
-  tpl="$1"
-  tmp="$WORKDIR/tmp/tg_msg.txt"
+start_cron_now() {
+  # 1) Prefer init script if present
+  if [ -x /opt/etc/init.d/S10cron ]; then
+    /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
+  fi
 
-  [ -f "$tpl" ] || { log "TPL missing: $tpl"; return 0; }
-
-  cp "$tpl" "$tmp"
-
-  R_ESC="$(esc_sed "$ROUTER_NAME")"
-  L_ESC="$(esc_sed "$LINES")"
-  S_ESC="$(esc_sed "$SHA_SHOW")"
-  D_ESC="$(esc_sed "$DT")"
-  E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
-  E2_ESC="$(esc_sed "${ERR_LINES:-}")"
-
-  sed -i \
-    -e "s/{{ROUTER_NAME}}/${R_ESC}/g" \
-    -e "s/{{LINES}}/${L_ESC}/g" \
-    -e "s/{{SHA}}/${S_ESC}/g" \
-    -e "s/{{DT}}/${D_ESC}/g" \
-    -e "s/{{ERR_TITLE}}/${E1_ESC}/g" \
-    -e "s/{{ERR_LINES}}/${E2_ESC}/g" \
-    "$tmp" || true
-
-  tg_send "$(cat "$tmp")"
+  # 2) Fallback: run daemon directly
+  if ! ps | grep -q '[/]opt/sbin/crond'; then
+    if [ -x /opt/sbin/crond ]; then
+      /opt/sbin/crond >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
-# =========================
-# MAIN
-# =========================
+ensure_cron_autostart() {
+  # Universal hook for Keenetic+Entware: /opt/etc/rc.local (executed when /opt is ready on boot on many setups)
+  RC="/opt/etc/rc.local"
+  MARK_BEGIN="# kvas-sync: ensure crond (begin)"
+  MARK_END="# kvas-sync: ensure crond (end)"
 
-[ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
+  mkdir -p /opt/etc
 
-mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+  if [ ! -f "$RC" ]; then
+    cat > "$RC" <<'EOF'
+#!/bin/sh
+EOF
+    chmod +x "$RC"
+  else
+    chmod +x "$RC" >/dev/null 2>&1 || true
+  fi
 
-log "start"
-DT="$(dt_ru)"
+  # Remove old block if any (safe idempotency)
+  if grep -q "$MARK_BEGIN" "$RC" 2>/dev/null; then
+    # delete from begin to end
+    sed -i "/$MARK_BEGIN/,/$MARK_END/d" "$RC" 2>/dev/null || true
+  fi
 
-rm -f "$NEW_RAW" "$NEW_NORM"
+  cat >> "$RC" <<'EOF'
 
-if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
-  log "download failed"
-  ERR_TITLE="Ошибка загрузки"
-  ERR_LINES="• download failed"
-  render_and_send "$TPL_ERR"
-  exit 1
+# kvas-sync: ensure crond (begin)
+if ! ps | grep -q '[/]opt/sbin/crond'; then
+  if [ -x /opt/etc/init.d/S10cron ]; then
+    /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
+  elif [ -x /opt/sbin/crond ]; then
+    /opt/sbin/crond >/dev/null 2>&1 || true
+  fi
 fi
-
-head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
-  log "download returned HTML"
-  ERR_TITLE="Ошибка загрузки"
-  ERR_LINES="• HTML вместо списка"
-  render_and_send "$TPL_ERR"
-  exit 1
+# kvas-sync: ensure crond (end)
+EOF
 }
 
-normalize_list "$NEW_RAW" "$NEW_NORM"
+download_and_unpack() {
+  mkdir -p "$TMPROOT"
+  mkdir -p "$WORK"
 
-LINES="$(wc -l < "$NEW_NORM" | tr -d ' ')"
-SHA="$(sha_full "$NEW_NORM")"
-SHA_SHOW="$(sha_show4 "$SHA")"
+  # Use github.com (not codeload.github.com) to avoid DNS issues
+  ARCHIVE_URL="https://github.com/${ORG}/${REPO}/archive/refs/heads/${BRANCH}.zip"
 
-if [ "$LINES" -lt "$MIN_LINES" ] || [ "$LINES" -gt "$MAX_LINES" ]; then
-  log "lines out of bounds: $LINES"
-  ERR_TITLE="Некорректный размер списка"
-  ERR_LINES="• строк: $LINES"
-  render_and_send "$TPL_ERR"
-  exit 1
-fi
+  say "Загрузка архива репозитория: ${ORG}/${REPO}@${BRANCH}"
+  curl -fsSLo "$ARCHIVE" "$ARCHIVE_URL"
 
-if [ -f "$CUR_FILE" ]; then
-  SHA_CUR="$(sha_full "$CUR_FILE")"
-else
-  SHA_CUR=""
-fi
+  [ -s "$ARCHIVE" ] || { say "❌ Архив не скачался или пустой."; exit 1; }
+  head -c 2 "$ARCHIVE" | grep -q "PK" || { say "❌ Скачанное не похоже на ZIP."; exit 1; }
 
-if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
-  log "SAME: normalized sha matched"
-  render_and_send "$TPL_SAME"
-  exit 0
-fi
+  say "Распаковка архива..."
+  unzip -qo "$ARCHIVE" -d "$WORK"
 
-if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
-  cp "$NEW_NORM" "$CUR_FILE"
-  log "IMPORT OK"
-  render_and_send "$TPL_OK"
-else
-  log "IMPORT FAILED"
-  ERR_TITLE="Ошибка импорта"
-  ERR_LINES="• команда: $IMPORT_CMD"
-  render_and_send "$TPL_ERR"
-fi
+  # Locate payload
+  KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit 2>/dev/null || true)"
+  if [ -z "$KS_PATH" ]; then
+    say "❌ Не найден payload/bin/kvas-sync.sh в архиве."
+    exit 1
+  fi
 
-exit 0
+  PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"
+  say "Найден payload: $PAYLOAD_DIR"
+  echo "$PAYLOAD_DIR"
+}
+
+deploy_payload() {
+  payload_dir="$1"
+
+  say "Развёртывание в $BASE ..."
+
+  mkdir -p "$BASE"
+  rm -rf "$BASE/bin" "$BASE/conf"
+  cp -R "$payload_dir/bin"  "$BASE/bin"
+  cp -R "$payload_dir/conf" "$BASE/conf"
+
+  chmod +x "$BASE/bin/kvas-sync.sh"
+
+  mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
+}
+
+write_configs() {
+  echo ""
+  echo "Введите данные Telegram"
+
+  BOT_TOKEN="$(ask "Токен бота")"
+  [ -n "$BOT_TOKEN" ] || { say "❌ Токен не может быть пустым"; exit 1; }
+
+  CHAT_ID="$(ask "ID чата")"
+  [ -n "$CHAT_ID" ] || { say "❌ ID чата не может быть пустым"; exit 1; }
+
+  ROUTER_NAME="$(ask "Введите имя роутера")"
+  [ -n "$ROUTER_NAME" ] || { say "❌ Имя роутера не может быть пустым"; exit 1; }
+
+  umask 077
+  cat > "$BASE/conf/secrets.conf" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+EOF
+  chmod 600 "$BASE/conf/secrets.conf"
+
+  cat > "$BASE/conf/device.conf" <<EOF
+ROUTER_NAME="$ROUTER_NAME"
+IMPORT_CMD="kvas import"
+EOF
+  chmod 644 "$BASE/conf/device.conf"
+}
+
+setup_cron() {
+  CRON_LINE="15 3 * * 3 /opt/kvas-sync/bin/kvas-sync.sh >> /opt/kvas-sync/log/cron.log 2>&1"
+  say "Настройка cron: каждую среду 03:15 (очистка и запись заново)"
+  printf "%s\n" "$CRON_LINE" | crontab -
+}
+
+main() {
+  say "Установка kvas-sync в $BASE"
+  ensure_deps
+
+  payload_dir="$(download_and_unpack)"
+  deploy_payload "$payload_dir"
+  write_configs
+  setup_cron
+
+  say "Запуск cron-демона..."
+  start_cron_now
+  ensure_cron_autostart
+
+  say "Пробный запуск..."
+  if /opt/kvas-sync/bin/kvas-sync.sh; then
+    say "✅ Установка завершена."
+  else
+    say "⚠️ Установка завершена, но пробный запуск с ошибкой. Смотрите: /opt/kvas-sync/log/kvas-sync.log"
+  fi
+}
+
+main "$@"
