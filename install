@@ -14,14 +14,8 @@ need_cmd() { command -v "$1" >/dev/null 2>&1; }
 say() { echo "$*" >&2; }
 
 ask() {
-  p="$1"; d="${2:-}"
-  if [ -n "$d" ]; then
-    printf "%s [%s]: " "$p" "$d" >&2
-  else
-    printf "%s: " "$p" >&2
-  fi
+  printf "%s: " "$1" >&2
   IFS= read -r ans || true
-  if [ -z "$ans" ] && [ -n "$d" ]; then ans="$d"; fi
   printf "%s" "$ans"
 }
 
@@ -33,10 +27,13 @@ install_deps() {
     say "❌ Entware (opkg) не найден."
     exit 1
   fi
+
   opkg update >/dev/null 2>&1 || true
+
   for pkg in curl ca-bundle unzip coreutils-timeout; do
     opkg install "$pkg" >/dev/null 2>&1 || true
   done
+
   need_cmd curl  || { say "❌ Нет curl"; exit 1; }
   need_cmd unzip || { say "❌ Нет unzip"; exit 1; }
   need_cmd find  || { say "❌ Нет find"; exit 1; }
@@ -58,18 +55,13 @@ head -c 2 "$ARCHIVE" | grep -q "PK" || { say "❌ Скачанное не пох
 say "Распаковка архива..."
 unzip -qo "$ARCHIVE" -d "$WORK"
 
-# ---- Надёжно ищем payload/bin/kvas-sync.sh где угодно ----
 KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit 2>/dev/null || true)"
 if [ -z "$KS_PATH" ]; then
-  say "❌ Не найден payload/bin/kvas-sync.sh в распакованном архиве"
-  say "ℹ️ Диагностика (каталоги, maxdepth=4):"
-  find "$WORK" -maxdepth 4 -type d | head -n 80 >&2
+  say "❌ Не найден payload/bin/kvas-sync.sh"
   exit 1
 fi
 
-PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"  # .../payload
-[ -d "$PAYLOAD_DIR/bin" ]  || { say "❌ Нет $PAYLOAD_DIR/bin"; exit 1; }
-[ -d "$PAYLOAD_DIR/conf" ] || { say "❌ Нет $PAYLOAD_DIR/conf"; exit 1; }
+PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"
 
 say "Найден payload: $PAYLOAD_DIR"
 say "Развёртывание в $BASE ..."
@@ -80,18 +72,19 @@ cp -R "$PAYLOAD_DIR/bin"  "$BASE/bin"
 cp -R "$PAYLOAD_DIR/conf" "$BASE/conf"
 chmod +x "$BASE/bin/kvas-sync.sh"
 
-# runtime dirs
 mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
 
 echo ""
-say "Введите данные Telegram (сохраним в $BASE/conf/secrets.conf, права 600)"
-BOT_TOKEN="$(ask "Токен бота" "")"
-CHAT_ID="$(ask "ID чата" "")"
-ROUTER_NAME="$(ask "Введите имя роутера" "")"
+echo "Введите данные Telegram"
 
-[ -n "$BOT_TOKEN" ]   || { say "❌ Пустой токен"; exit 1; }
-[ -n "$CHAT_ID" ]     || { say "❌ Пустой ID чата"; exit 1; }
-[ -n "$ROUTER_NAME" ] || { say "❌ Пустое имя"; exit 1; }
+BOT_TOKEN="$(ask "Токен бота")"
+[ -n "$BOT_TOKEN" ] || { say "❌ Токен не может быть пустым"; exit 1; }
+
+CHAT_ID="$(ask "ID чата")"
+[ -n "$CHAT_ID" ] || { say "❌ ID чата не может быть пустым"; exit 1; }
+
+ROUTER_NAME="$(ask "Введите имя роутера")"
+[ -n "$ROUTER_NAME" ] || { say "❌ Имя роутера не может быть пустым"; exit 1; }
 
 umask 077
 cat > "$BASE/conf/secrets.conf" <<EOF
@@ -100,27 +93,21 @@ CHAT_ID="$CHAT_ID"
 EOF
 chmod 600 "$BASE/conf/secrets.conf"
 
-# ✅ ВАЖНО: создаём device.conf без sed (чтобы / & \ не ломали запись)
 cat > "$BASE/conf/device.conf" <<EOF
-# ===== DEVICE SETTINGS =====
 ROUTER_NAME="$ROUTER_NAME"
-
-# Команда импорта KVAS. Скрипт сам передаст путь к списку.
 IMPORT_CMD="kvas import"
 EOF
 chmod 644 "$BASE/conf/device.conf"
 
-# cron
+# ===== CRON "под 0" =====
 CRON_LINE="15 3 * * 3 /opt/kvas-sync/bin/kvas-sync.sh >> /opt/kvas-sync/log/cron.log 2>&1"
-say "Настройка cron: каждую среду 03:15"
-crontab -l 2>/dev/null | grep -v '/opt/kvas-sync/bin/kvas-sync.sh' > /opt/tmp/kvas_cron.tmp || true
-echo "$CRON_LINE" >> /opt/tmp/kvas_cron.tmp
-crontab /opt/tmp/kvas_cron.tmp
-rm -f /opt/tmp/kvas_cron.tmp
+
+say "Настройка cron: каждую среду 03:15 (очистка и запись заново)"
+printf "%s\n" "$CRON_LINE" | crontab -
 
 say "Пробный запуск..."
 if /opt/kvas-sync/bin/kvas-sync.sh; then
   say "✅ Установка завершена."
 else
-  say "⚠️ Установка завершена, но пробный запуск с ошибкой. Смотрите /opt/kvas-sync/log."
+  say "⚠️ Установка завершена, но пробный запуск с ошибкой."
 fi
