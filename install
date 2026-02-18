@@ -1,14 +1,13 @@
 #!/bin/sh
 set -eu
 
-# ===== FIXED GITHUB =====
 ORG="SkyNextGen"
 REPO="kvas-sync"
 BRANCH="main"
 
 BASE="/opt/kvas-sync"
-TMP="/opt/tmp/kvas-sync-install.$$"
-ARCHIVE_ZIP="/opt/tmp/kvas-sync-main.zip"
+WORK="/opt/tmp/kvas-sync-install.$$"
+ARCHIVE="/opt/tmp/kvas-sync-${BRANCH}.zip"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 say() { echo "$*" >&2; }
@@ -25,82 +24,77 @@ ask() {
   printf "%s" "$ans"
 }
 
+cleanup() { rm -rf "$WORK" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
 install_deps() {
   if ! need_cmd opkg; then
     say "❌ Entware (opkg) не найден."
     exit 1
   fi
-
   opkg update >/dev/null 2>&1 || true
-  # unzip нужен для архива репозитория, ca-bundle чтобы curl по https не падал
   for pkg in curl ca-bundle unzip coreutils-timeout; do
     opkg install "$pkg" >/dev/null 2>&1 || true
   done
-
-  need_cmd curl || { say "❌ Нет curl"; exit 1; }
+  need_cmd curl  || { say "❌ Нет curl"; exit 1; }
   need_cmd unzip || { say "❌ Нет unzip"; exit 1; }
+  need_cmd find  || { say "❌ Нет find"; exit 1; }
 }
 
-cleanup() {
-  rm -rf "$TMP" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-say "Установка kvas-sync в ${BASE}"
+say "Установка kvas-sync в $BASE"
 install_deps
 
 mkdir -p /opt/tmp
-mkdir -p "$TMP"
+mkdir -p "$WORK"
 
-# ===== Download GitHub auto-generated archive of branch =====
-# Это не raw-файл, а стабильный zip, который GitHub генерирует сам
 ARCHIVE_URL="https://codeload.github.com/${ORG}/${REPO}/zip/refs/heads/${BRANCH}"
-
 say "Загрузка архива репозитория: ${ORG}/${REPO}@${BRANCH}"
-curl -fsSLo "$ARCHIVE_ZIP" "$ARCHIVE_URL"
+curl -fsSLo "$ARCHIVE" "$ARCHIVE_URL"
 
-# защита от пустоты/HTML
-[ -s "$ARCHIVE_ZIP" ] || { say "❌ Архив не скачался или пустой."; exit 1; }
-
-# Проверка сигнатуры ZIP ("PK")
-head -c 2 "$ARCHIVE_ZIP" | grep -q "PK" || {
-  say "❌ Скачанное не похоже на ZIP (возможно блокировка/подмена)."
-  exit 1
-}
+[ -s "$ARCHIVE" ] || { say "❌ Архив не скачался или пустой"; exit 1; }
+head -c 2 "$ARCHIVE" | grep -q "PK" || { say "❌ Скачанное не похоже на ZIP"; exit 1; }
 
 say "Распаковка архива..."
-unzip -qo "$ARCHIVE_ZIP" -d "$TMP"
+unzip -qo "$ARCHIVE" -d "$WORK"
 
-# Внутри будет каталог вида kvas-sync-main/
-SRC_DIR="$(find "$TMP" -maxdepth 1 -type d -name "${REPO}-*" | head -n 1)"
-[ -n "${SRC_DIR:-}" ] || { say "❌ Не найден каталог репозитория после распаковки."; exit 1; }
+# ---- НАДЕЖНО: ищем сам файл payload/bin/kvas-sync.sh где угодно ----
+KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit 2>/dev/null || true)"
+if [ -z "$KS_PATH" ]; then
+  say "❌ Не найден payload/bin/kvas-sync.sh в распакованном архиве"
+  say "ℹ️ Диагностика (топ-уровень):"
+  find "$WORK" -maxdepth 3 -type d | head -n 50 >&2
+  exit 1
+fi
 
-# Проверяем наличие payload
-[ -d "$SRC_DIR/payload/bin" ] || { say "❌ В репозитории нет payload/bin"; exit 1; }
-[ -x "$SRC_DIR/payload/bin/kvas-sync.sh" ] || chmod +x "$SRC_DIR/payload/bin/kvas-sync.sh" || true
+# KS_PATH = .../<repo-root>/payload/bin/kvas-sync.sh
+PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"         # .../<repo-root>/payload
+REPO_ROOT="$(dirname "$PAYLOAD_DIR")"                    # .../<repo-root>
 
-# ===== Deploy to /opt/kvas-sync preserving your structure =====
-say "Развёртывание payload -> ${BASE}"
+# sanity: должны существовать payload/bin и payload/conf
+[ -d "$PAYLOAD_DIR/bin" ]  || { say "❌ Нет $PAYLOAD_DIR/bin"; exit 1; }
+[ -d "$PAYLOAD_DIR/conf" ] || { say "❌ Нет $PAYLOAD_DIR/conf"; exit 1; }
+
+say "Найден payload: $PAYLOAD_DIR"
+say "Развёртывание в $BASE ..."
+
 mkdir -p "$BASE"
-
-# bin/conf — из payload
 rm -rf "$BASE/bin" "$BASE/conf"
-mkdir -p "$BASE"
-cp -R "$SRC_DIR/payload/bin"  "$BASE/bin"
-cp -R "$SRC_DIR/payload/conf" "$BASE/conf"
-
+cp -R "$PAYLOAD_DIR/bin"  "$BASE/bin"
+cp -R "$PAYLOAD_DIR/conf" "$BASE/conf"
 chmod +x "$BASE/bin/kvas-sync.sh"
 
-# ===== Interactive config =====
+# runtime dirs
+mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
+
 echo ""
 say "Введите данные Telegram (сохраним в $BASE/conf/secrets.conf, права 600)"
 BOT_TOKEN="$(ask "Токен бота" "")"
 CHAT_ID="$(ask "ID чата" "")"
 ROUTER_NAME="$(ask "Имя роутера (на русском)" "Keenetic-1")"
 
-[ -n "$BOT_TOKEN" ] || { say "❌ Пустой токен."; exit 1; }
-[ -n "$CHAT_ID" ] || { say "❌ Пустой chat_id."; exit 1; }
-[ -n "$ROUTER_NAME" ] || { say "❌ Пустое имя роутера."; exit 1; }
+[ -n "$BOT_TOKEN" ] || { say "❌ Пустой токен"; exit 1; }
+[ -n "$CHAT_ID" ]   || { say "❌ Пустой ID чата"; exit 1; }
+[ -n "$ROUTER_NAME" ] || { say "❌ Пустое имя"; exit 1; }
 
 umask 077
 cat > "$BASE/conf/secrets.conf" <<EOF
@@ -109,9 +103,8 @@ CHAT_ID="$CHAT_ID"
 EOF
 chmod 600 "$BASE/conf/secrets.conf"
 
-# device.conf — создаём из example (если есть), иначе минимальный
+# device.conf из device.example.conf, если есть
 if [ -f "$BASE/conf/device.example.conf" ]; then
-  # копируем example -> device.conf и подставляем имя, если есть ключ ROUTER_NAME
   cp "$BASE/conf/device.example.conf" "$BASE/conf/device.conf"
   if grep -q '^ROUTER_NAME=' "$BASE/conf/device.conf" 2>/dev/null; then
     sed -i "s/^ROUTER_NAME=.*/ROUTER_NAME=\"$ROUTER_NAME\"/" "$BASE/conf/device.conf" || true
@@ -125,24 +118,17 @@ EOF
 fi
 chmod 644 "$BASE/conf/device.conf"
 
-# ===== Ensure runtime dirs =====
-mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
-
-# ===== Cron (Wed 03:15 MSK) =====
+# cron
 CRON_LINE="15 3 * * 3 /opt/kvas-sync/bin/kvas-sync.sh >> /opt/kvas-sync/log/cron.log 2>&1"
 say "Настройка cron: каждую среду 03:15"
-
-# вы просили: при повторном запуске пусть прописывается заново как новый — делаем так:
-# удаляем старые строки и добавляем новую (в итоге одна актуальная строка)
 crontab -l 2>/dev/null | grep -v '/opt/kvas-sync/bin/kvas-sync.sh' > /opt/tmp/kvas_cron.tmp || true
 echo "$CRON_LINE" >> /opt/tmp/kvas_cron.tmp
 crontab /opt/tmp/kvas_cron.tmp
 rm -f /opt/tmp/kvas_cron.tmp
 
-# ===== Test run =====
 say "Пробный запуск..."
 if /opt/kvas-sync/bin/kvas-sync.sh; then
   say "✅ Установка завершена."
 else
-  say "⚠️ Установка завершена, но пробный запуск с ошибкой (смотрите /opt/kvas-sync/log)."
+  say "⚠️ Установка завершена, но пробный запуск с ошибкой. Смотрите /opt/kvas-sync/log."
 fi
