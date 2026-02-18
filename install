@@ -87,7 +87,7 @@ echo ""
 say "Введите данные Telegram (сохраним в $BASE/conf/secrets.conf, права 600)"
 BOT_TOKEN="$(ask "Токен бота" "")"
 CHAT_ID="$(ask "ID чата" "")"
-ROUTER_NAME="$(ask "Имя роутера (на русском)" "Keenetic-1")"
+ROUTER_NAME="$(ask "Введите имя роутера" "")"
 
 [ -n "$BOT_TOKEN" ]   || { say "❌ Пустой токен"; exit 1; }
 [ -n "$CHAT_ID" ]     || { say "❌ Пустой ID чата"; exit 1; }
