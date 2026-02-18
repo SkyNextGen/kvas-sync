@@ -45,7 +45,9 @@ install_deps
 mkdir -p /opt/tmp
 mkdir -p "$WORK"
 
-ARCHIVE_URL="https://codeload.github.com/${ORG}/${REPO}/zip/refs/heads/${BRANCH}"
+# ✅ ВАЖНО: берём архив с github.com (а не codeload.github.com)
+ARCHIVE_URL="https://github.com/${ORG}/${REPO}/archive/refs/heads/${BRANCH}.zip"
+
 say "Загрузка архива репозитория: ${ORG}/${REPO}@${BRANCH}"
 curl -fsSLo "$ARCHIVE" "$ARCHIVE_URL"
 
