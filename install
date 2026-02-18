@@ -1,0 +1,180 @@
+#!/bin/sh
+set -eu
+
+# KVAS-SYNC installer for Keenetic / Entware (BusyBox ash)
+#
+# Запуск (вариант B):
+#   cd /opt/tmp
+#   curl -fsSLo install "https://raw.githubusercontent.com/<ORG>/<REPO>/<BRANCH>/install"
+#   sh install
+
+# ===== defaults =====
+DEFAULT_ORG="SkyNextGen"
+DEFAULT_REPO="kvas-sync"
+DEFAULT_BRANCH="main"
+DEFAULT_ROUTER_NAME="Keenetic-1"
+INSTALL_DIR="/opt/kvas-sync"
+TMP_DIR="/opt/tmp"
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+say() { echo "$*" >&2; }
+
+die() { say "ERROR: $*"; exit 1; }
+
+prompt() {
+  # prompt "Вопрос" "default" -> echo answer
+  p="$1"; d="${2:-}"
+  if [ -n "$d" ]; then
+    printf "%s [%s]: " "$p" "$d" >&2
+  else
+    printf "%s: " "$p" >&2
+  fi
+  IFS= read -r ans || true
+  if [ -z "${ans:-}" ] && [ -n "$d" ]; then ans="$d"; fi
+  printf "%s" "$ans"
+}
+
+prompt_secret() {
+  p="$1"
+  printf "%s: " "$p" >&2
+  if need_cmd stty; then
+    stty -echo 2>/dev/null || true
+    IFS= read -r ans || true
+    stty echo 2>/dev/null || true
+    printf "\n" >&2
+  else
+    IFS= read -r ans || true
+  fi
+  printf "%s" "$ans"
+}
+
+opkg_path() {
+  if need_cmd opkg; then
+    command -v opkg
+    return 0
+  fi
+  if [ -x "/opt/bin/opkg" ]; then
+    echo "/opt/bin/opkg"
+    return 0
+  fi
+  return 1
+}
+
+ensure_deps() {
+  OPKG="$(opkg_path)" || die "Entware не найден (нет opkg). Проверь, что /opt смонтирован и Entware установлен."
+
+  need_update=0
+
+  # cmd:pkg
+  REQ="curl:curl unzip:unzip timeout:coreutils-timeout sha256sum:coreutils-sha256sum"
+
+  missing_pkgs=""
+  for pair in $REQ; do
+    cmd="${pair%%:*}"
+    pkg="${pair#*:}"
+    if ! need_cmd "$cmd"; then
+      missing_pkgs="$missing_pkgs $pkg"
+      need_update=1
+    fi
+  done
+
+  # TLS certificates for curl (GitHub/Telegram)
+  if [ ! -f /opt/etc/ssl/certs/ca-certificates.crt ] && [ ! -f /opt/etc/ssl/certs/ca-bundle.crt ]; then
+    missing_pkgs="$missing_pkgs ca-bundle"
+    need_update=1
+  fi
+
+  if [ "$need_update" -eq 0 ]; then
+    return 0
+  fi
+
+  say "Устанавливаю зависимости через opkg:$missing_pkgs"
+  "$OPKG" update >/dev/null 2>&1 || true
+
+  # shellcheck disable=SC2086
+  "$OPKG" install $missing_pkgs >/dev/null 2>&1 || {
+    say "Не удалось установить зависимости автоматически. Попробуй вручную:" >&2
+    say "  opkg update" >&2
+    say "  opkg install$missing_pkgs" >&2
+    exit 1
+  }
+}
+
+main() {
+  ensure_deps
+
+  mkdir -p "$TMP_DIR" "$INSTALL_DIR"
+  ORG="${KVAS_SYNC_ORG:-$DEFAULT_ORG}"
+  REPO="${KVAS_SYNC_REPO:-$DEFAULT_REPO}"
+  BRANCH="${KVAS_SYNC_BRANCH:-$DEFAULT_BRANCH}"
+
+  say "Введите данные Telegram (они будут сохранены в conf/secrets.conf с правами 600)"
+  TG_BOT_TOKEN="$(prompt_secret "Токен бота")"
+  TG_CHAT_ID="$(prompt "ID чата" "")"
+  ROUTER_NAME="$(prompt "Имя роутера (на русском)" "$DEFAULT_ROUTER_NAME")"
+
+  [ -n "$TG_BOT_TOKEN" ] || die "Токен бота обязателен"
+  [ -n "$TG_CHAT_ID" ] || die "ID чата обязателен"
+  [ -n "$ROUTER_NAME" ] || die "Имя роутера обязательно"
+
+  PAYLOAD_URL="https://raw.githubusercontent.com/${ORG}/${REPO}/${BRANCH}/kvas-sync-payload.zip"
+  TMP_ZIP="${TMP_DIR}/kvas-sync-payload.zip"
+
+  say "Скачиваю payload: $PAYLOAD_URL"
+  curl -fsSL "$PAYLOAD_URL" -o "$TMP_ZIP" || die "Не удалось скачать payload (проверь org/repo/branch и доступ к GitHub)"
+
+  say "Устанавливаю в: $INSTALL_DIR"
+  unzip -o "$TMP_ZIP" -d "$INSTALL_DIR" >/dev/null || die "Не удалось распаковать payload"
+
+  [ -x "$INSTALL_DIR/bin/kvas-sync.sh" ] || chmod +x "$INSTALL_DIR/bin/kvas-sync.sh" 2>/dev/null || true
+
+  # configs
+  mkdir -p "$INSTALL_DIR/conf"
+
+  # secrets.conf
+  cat > "$INSTALL_DIR/conf/secrets.conf" <<EOF
+# ===== TELEGRAM SECRETS =====
+TG_BOT_TOKEN="${TG_BOT_TOKEN}"
+TG_CHAT_ID="${TG_CHAT_ID}"
+EOF
+  chmod 600 "$INSTALL_DIR/conf/secrets.conf"
+
+  # device.conf (use example if present)
+  if [ -f "$INSTALL_DIR/conf/device.example.conf" ]; then
+    cp "$INSTALL_DIR/conf/device.example.conf" "$INSTALL_DIR/conf/device.conf"
+  else
+    cat > "$INSTALL_DIR/conf/device.conf" <<EOF
+# ===== DEVICE SETTINGS =====
+ROUTER_NAME="${DEFAULT_ROUTER_NAME}"
+IMPORT_CMD="kvas import"
+EOF
+  fi
+
+  # apply router name (preserve other settings)
+  if grep -q '^ROUTER_NAME=' "$INSTALL_DIR/conf/device.conf" 2>/dev/null; then
+    sed -i "s/^ROUTER_NAME=.*/ROUTER_NAME=\"$(printf '%s' "$ROUTER_NAME" | sed 's/[\\\"$]/\\&/g')\"/" "$INSTALL_DIR/conf/device.conf" || true
+  else
+    printf '\nROUTER_NAME="%s"\n' "$ROUTER_NAME" >> "$INSTALL_DIR/conf/device.conf"
+  fi
+  chmod 644 "$INSTALL_DIR/conf/device.conf"
+
+  # cron (Wed 03:15 local router time)
+  CRON_LINE="15 3 * * 3 ${INSTALL_DIR}/bin/kvas-sync.sh >/dev/null 2>&1"
+  ( crontab -l 2>/dev/null | grep -v "${INSTALL_DIR}/bin/kvas-sync.sh" || true; echo "$CRON_LINE" ) | crontab -
+
+  say "Готово ✅"
+  say "  • Скрипт: ${INSTALL_DIR}/bin/kvas-sync.sh"
+  say "  • Крон:  каждую среду 03:15"
+
+  say "Пробный запуск..."
+  if "${INSTALL_DIR}/bin/kvas-sync.sh"; then
+    say "OK: пробный запуск успешен (сообщение должно уйти в Telegram)"
+  else
+    say "FAIL: пробный запуск завершился с ошибкой. Проверь лог:" 
+    say "  ${INSTALL_DIR}/log/kvas-sync.log"
+    exit 1
+  fi
+}
+
+main "$@"
