@@ -1,7 +1,6 @@
 #!/bin/sh
 set -eu
 
-# ===== FIXED GITHUB =====
 ORG="SkyNextGen"
 REPO="kvas-sync"
 BRANCH="main"
@@ -14,7 +13,7 @@ need_cmd() { command -v "$1" >/dev/null 2>&1; }
 say() { echo "$*" >&2; }
 
 ask() {
-  printf "%s: " "$1"
+  printf "%s: " "$1" >&2
   IFS= read -r ans || true
   printf "%s" "$ans"
 }
@@ -59,14 +58,10 @@ KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit 
 
 if [ -z "$KS_PATH" ]; then
   say "❌ Не найден payload/bin/kvas-sync.sh"
-  find "$WORK" -maxdepth 4 -type d | head -n 80 >&2
   exit 1
 fi
 
 PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"
-
-[ -d "$PAYLOAD_DIR/bin" ]  || { say "❌ Нет $PAYLOAD_DIR/bin"; exit 1; }
-[ -d "$PAYLOAD_DIR/conf" ] || { say "❌ Нет $PAYLOAD_DIR/conf"; exit 1; }
 
 say "Найден payload: $PAYLOAD_DIR"
 say "Развёртывание в $BASE ..."
@@ -80,7 +75,7 @@ chmod +x "$BASE/bin/kvas-sync.sh"
 mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
 
 echo ""
-say "Введите данные Telegram"
+echo "Введите данные Telegram"
 
 BOT_TOKEN="$(ask "Токен бота")"
 [ -n "$BOT_TOKEN" ] || { say "❌ Токен не может быть пустым"; exit 1; }
@@ -99,10 +94,7 @@ EOF
 chmod 600 "$BASE/conf/secrets.conf"
 
 cat > "$BASE/conf/device.conf" <<EOF
-# ===== DEVICE SETTINGS =====
 ROUTER_NAME="$ROUTER_NAME"
-
-# Команда импорта KVAS. Скрипт сам передаст путь к списку.
 IMPORT_CMD="kvas import"
 EOF
 chmod 644 "$BASE/conf/device.conf"
