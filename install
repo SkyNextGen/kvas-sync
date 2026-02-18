@@ -1,7 +1,6 @@
 #!/bin/sh
 set -eu
 
-# ===== FIXED GITHUB =====
 ORG="SkyNextGen"
 REPO="kvas-sync"
 BRANCH="main"
@@ -39,13 +38,61 @@ install_deps() {
   need_cmd find  || { say "❌ Нет find"; exit 1; }
 }
 
+start_cron_now() {
+  # 1) пробуем штатный init.d (если есть)
+  if [ -x /opt/etc/init.d/S10cron ]; then
+    /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
+  fi
+
+  # 2) если всё ещё не запущен — стартуем напрямую
+  if ! ps | grep -q '[/]opt/sbin/crond'; then
+    if [ -x /opt/sbin/crond ]; then
+      /opt/sbin/crond >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+ensure_cron_autostart() {
+  # Универсальный “якорь” автозапуска: /opt/etc/rc.local
+  # (на Keenetic/Entware часто исполняется при монтировании /opt на старте)
+  RC="/opt/etc/rc.local"
+  MARK="# kvas-sync: ensure crond"
+
+  mkdir -p /opt/etc
+
+  if [ ! -f "$RC" ]; then
+    cat > "$RC" <<'EOF'
+#!/bin/sh
+EOF
+    chmod +x "$RC"
+  else
+    # гарантируем, что файл исполняемый
+    chmod +x "$RC" >/dev/null 2>&1 || true
+  fi
+
+  # добавляем блок один раз
+  if ! grep -q "$MARK" "$RC" 2>/dev/null; then
+    cat >> "$RC" <<'EOF'
+
+# kvas-sync: ensure crond
+if ! ps | grep -q '[/]opt/sbin/crond'; then
+  if [ -x /opt/etc/init.d/S10cron ]; then
+    /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
+  elif [ -x /opt/sbin/crond ]; then
+    /opt/sbin/crond >/dev/null 2>&1 || true
+  fi
+fi
+EOF
+  fi
+}
+
 say "Установка kvas-sync в $BASE"
 install_deps
 
 mkdir -p /opt/tmp
 mkdir -p "$WORK"
 
-# ✅ ВАЖНО: берём архив с github.com (а не codeload.github.com)
+# архив через github.com (чтобы не зависеть от codeload)
 ARCHIVE_URL="https://github.com/${ORG}/${REPO}/archive/refs/heads/${BRANCH}.zip"
 
 say "Загрузка архива репозитория: ${ORG}/${REPO}@${BRANCH}"
@@ -101,11 +148,15 @@ IMPORT_CMD="kvas import"
 EOF
 chmod 644 "$BASE/conf/device.conf"
 
-# ===== CRON "под 0" =====
+# cron "под 0"
 CRON_LINE="15 3 * * 3 /opt/kvas-sync/bin/kvas-sync.sh >> /opt/kvas-sync/log/cron.log 2>&1"
-
 say "Настройка cron: каждую среду 03:15 (очистка и запись заново)"
 printf "%s\n" "$CRON_LINE" | crontab -
+
+# стартуем cron сейчас + обеспечиваем автозапуск
+say "Запуск cron-демона..."
+start_cron_now
+ensure_cron_autostart
 
 say "Пробный запуск..."
 if /opt/kvas-sync/bin/kvas-sync.sh; then
