@@ -87,18 +87,34 @@ tg_send() {
     return 0
   fi
 
-  # ⏳ важно при чистой установке (сеть/DNS могут быть не готовы)
-  sleep 10
+  # Для Entware: иногда curl берёт не тот resolv.conf
+  if [ -f /opt/etc/resolv.conf ]; then
+    RESOLV_CONF="/opt/etc/resolv.conf"
+    export RESOLV_CONF
+  fi
 
-  resp="$(curl -sS -m 20 -X POST \
-    "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${CHAT_ID}" \
-    --data-urlencode "text=${msg}" 2>&1)" || {
-      log "TG: send failed: $resp"
-      return 0
-    }
+  # После чистой установки сеть/DNS могут подняться не сразу → ретраи + warm-up
+  tries=5
+  delay=6
 
-  echo "$resp" | grep -q '"ok":true' || log "TG: api error: $resp"
+  i=1
+  while [ "$i" -le "$tries" ]; do
+    nslookup api.telegram.org >/dev/null 2>&1 || true
+
+    resp="$(curl -sS -m 20 -X POST \
+      "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${CHAT_ID}" \
+      --data-urlencode "text=${msg}" 2>&1)" && {
+        echo "$resp" | grep -q '"ok":true' && return 0
+        log "TG: api error: $resp"
+        return 0
+      }
+
+    log "TG: send failed (try ${i}/${tries}): $resp"
+    i=$((i+1))
+    sleep "$delay"
+  done
+
   return 0
 }
 
