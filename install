@@ -29,17 +29,18 @@ install_pkgs() {
 }
 
 ensure_deps() {
-  need_cmd opkg || { say "❌ Entware не найден"; exit 1; }
+  need_cmd opkg || { say "❌ Entware (opkg) не найден. Проверьте, что /opt смонтирован."; exit 1; }
 
   say "Проверка зависимостей Entware..."
   opkg update >/dev/null 2>&1 || true
 
+  # критично для работы
   install_pkgs curl ca-bundle unzip coreutils-timeout cron vixie-cron cronie
 
-  need_cmd curl || { say "❌ curl не найден"; exit 1; }
-  need_cmd unzip || { say "❌ unzip не найден"; exit 1; }
-  need_cmd timeout || { say "❌ timeout не найден"; exit 1; }
-  need_cmd crontab || { say "❌ cron не найден"; exit 1; }
+  need_cmd curl    || { say "❌ curl не найден"; exit 1; }
+  need_cmd unzip   || { say "❌ unzip не найден"; exit 1; }
+  need_cmd timeout || { say "❌ timeout не найден (coreutils-timeout)"; exit 1; }
+  need_cmd crontab || { say "❌ crontab не найден (cron/vixie-cron)"; exit 1; }
 }
 
 download_and_unpack() {
@@ -54,9 +55,11 @@ download_and_unpack() {
   unzip -qo "$ARCHIVE" -d "$WORK"
 
   KS_PATH="$(find "$WORK" -type f -path '*/payload/bin/kvas-sync.sh' -print -quit)"
-  [ -n "$KS_PATH" ] || { say "❌ payload не найден"; exit 1; }
+  [ -n "$KS_PATH" ] || { say "❌ payload/bin/kvas-sync.sh не найден"; exit 1; }
 
-  dirname "$(dirname "$KS_PATH")"
+  PAYLOAD_DIR="$(dirname "$(dirname "$KS_PATH")")"
+  say "Найден payload: $PAYLOAD_DIR"
+  echo "$PAYLOAD_DIR"
 }
 
 deploy_payload() {
@@ -69,12 +72,17 @@ deploy_payload() {
   cp -R "$payload/conf" "$BASE/conf"
 
   chmod +x "$BASE/bin/kvas-sync.sh"
-
   mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
 
-  # sanity check
+  # sanity-check: должен быть агент
   if ! grep -q "KVAS-SYNC Router Agent" "$BASE/bin/kvas-sync.sh" 2>/dev/null; then
     say "❌ Ошибка: payload/bin/kvas-sync.sh не является агентом."
+    exit 1
+  fi
+
+  # sanity-check: в агенте не должно быть install-stub
+  if grep -q "cat[[:space:]]*>[[:space:]]*/opt/kvas-sync/bin/kvas-sync.sh" "$BASE/bin/kvas-sync.sh" 2>/dev/null; then
+    say "❌ Ошибка: в payload/bin/kvas-sync.sh найден install-stub (cat > ...)."
     exit 1
   fi
 }
@@ -88,7 +96,7 @@ write_configs() {
   ROUTER_NAME="$(ask "Введите имя роутера")"
 
   [ -n "$BOT_TOKEN" ] || { say "❌ Токен пуст"; exit 1; }
-  [ -n "$CHAT_ID" ] || { say "❌ ID пуст"; exit 1; }
+  [ -n "$CHAT_ID" ] || { say "❌ ID чата пуст"; exit 1; }
   [ -n "$ROUTER_NAME" ] || { say "❌ Имя роутера пустое"; exit 1; }
 
   umask 077
@@ -102,6 +110,7 @@ EOF
 ROUTER_NAME="$ROUTER_NAME"
 IMPORT_CMD="kvas import"
 EOF
+  chmod 644 "$BASE/conf/device.conf"
 }
 
 setup_cron() {
@@ -123,20 +132,23 @@ start_cron() {
 test_run() {
   say "Пробный запуск..."
 
+  # сброс lock и логов для понятного теста
   rm -rf "$BASE/state/import.lock" 2>/dev/null || true
+  rm -f "$BASE/log/kvas-sync.log" 2>/dev/null || true
 
   INSTALL_LOG="$BASE/log/install-run.log"
-  mkdir -p "$BASE/log"
   echo "===== install test run: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$INSTALL_LOG"
 
-  # Запускаем агент и пишем ПОЛНЫЙ xtrace в лог
-  sh -x "$BASE/bin/kvas-sync.sh" >>"$INSTALL_LOG" 2>&1 || true
+  # ВАЖНО: запуск агента напрямую, без "sh -x"
+  "$BASE/bin/kvas-sync.sh" >>"$INSTALL_LOG" 2>&1 || true
 
   echo "----- tail install-run.log -----"
   tail -n 200 "$INSTALL_LOG" 2>/dev/null || true
   echo "--------------------------------"
 
-  if [ ! -f "$BASE/log/kvas-sync.log" ]; then
+  if [ -f "$BASE/log/kvas-sync.log" ]; then
+    say "✅ Агент создал kvas-sync.log"
+  else
     say "⚠️ Агент не создал kvas-sync.log — смотрите install-run.log"
   fi
 
