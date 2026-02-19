@@ -71,6 +71,12 @@ deploy_payload() {
   chmod +x "$BASE/bin/kvas-sync.sh"
 
   mkdir -p "$BASE/log" "$BASE/state" "$BASE/tmp"
+
+  # sanity check
+  if ! grep -q "KVAS-SYNC Router Agent" "$BASE/bin/kvas-sync.sh" 2>/dev/null; then
+    say "❌ Ошибка: payload/bin/kvas-sync.sh не является агентом."
+    exit 1
+  fi
 }
 
 write_configs() {
@@ -81,9 +87,9 @@ write_configs() {
   CHAT_ID="$(ask "ID чата")"
   ROUTER_NAME="$(ask "Введите имя роутера")"
 
-  [ -n "$BOT_TOKEN" ] || exit 1
-  [ -n "$CHAT_ID" ] || exit 1
-  [ -n "$ROUTER_NAME" ] || exit 1
+  [ -n "$BOT_TOKEN" ] || { say "❌ Токен пуст"; exit 1; }
+  [ -n "$CHAT_ID" ] || { say "❌ ID пуст"; exit 1; }
+  [ -n "$ROUTER_NAME" ] || { say "❌ Имя роутера пустое"; exit 1; }
 
   umask 077
   cat > "$BASE/conf/secrets.conf" <<EOF
@@ -117,14 +123,25 @@ start_cron() {
 test_run() {
   say "Пробный запуск..."
 
-  rm -rf /opt/kvas-sync/state/import.lock 2>/dev/null || true
+  rm -rf "$BASE/state/import.lock" 2>/dev/null || true
 
-  INSTALL_LOG="/opt/kvas-sync/log/install-run.log"
+  INSTALL_LOG="$BASE/log/install-run.log"
+  mkdir -p "$BASE/log"
   echo "===== install test run: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$INSTALL_LOG"
 
-  sh -x /opt/kvas-sync/bin/kvas-sync.sh 2>&1 | tee -a "$INSTALL_LOG"
+  # Запускаем агент и пишем ПОЛНЫЙ xtrace в лог
+  sh -x "$BASE/bin/kvas-sync.sh" >>"$INSTALL_LOG" 2>&1 || true
+
+  echo "----- tail install-run.log -----"
+  tail -n 200 "$INSTALL_LOG" 2>/dev/null || true
+  echo "--------------------------------"
+
+  if [ ! -f "$BASE/log/kvas-sync.log" ]; then
+    say "⚠️ Агент не создал kvas-sync.log — смотрите install-run.log"
+  fi
 
   say "Лог пробного запуска: $INSTALL_LOG"
+  say "Лог агента: $BASE/log/kvas-sync.log"
 }
 
 main() {
