@@ -1,4 +1,3 @@
-cat > /opt/kvas-sync/bin/kvas-sync.sh <<'EOF'
 #!/bin/sh
 set -eu
 
@@ -194,5 +193,3 @@ else
 fi
 
 exit 0
-EOF
-chmod +x /opt/kvas-sync/bin/kvas-sync.sh
