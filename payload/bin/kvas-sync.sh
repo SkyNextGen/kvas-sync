@@ -76,6 +76,32 @@ force_crypt_on() {
     log "KVAS: binary not found at $KVAS (PATH=$PATH)"
   fi
 }
+
+ensure_dnscrypt_running() {
+  # dnsmasq завязан на локальный dnscrypt-proxy (обычно порт 9153).
+  # Если dnscrypt не слушает порт — принудительно поднимаем через `kvas crypt on`.
+  # Это лечит кейс, когда после `kvas update` dnscrypt остаётся остановленным и DNS "умирает".
+  port="${1:-9153}"
+
+  if netstat -ln 2>/dev/null | grep -q ":${port}"; then
+    log "DNSCRYPT: already listening on :${port}"
+    return 0
+  fi
+
+  log "DNSCRYPT: not listening on :${port}, forcing start via KVAS"
+  force_crypt_on
+
+  i=0
+  while [ "$i" -lt 10 ]; do
+    netstat -ln 2>/dev/null | grep -q ":${port}" && { log "DNSCRYPT: up after ${i}s"; return 0; }
+    sleep 1
+    i=$((i+1))
+  done
+
+  log "DNSCRYPT: still NOT listening on :${port} after ${i}s"
+  return 1
+}
+
 trap force_crypt_on EXIT
 
 
@@ -119,158 +145,11 @@ tg_send() {
     log "TG: skip (no token/chat_id)"
     return 0
   fi
+  ensure_dnscrypt_running 9153 || true
   # KVAS/DNS: перед отправкой в TG принудительно включаем DNS-шифрование и ждём восстановления резолва.
   force_crypt_on
-
-t=0
-while [ "$t" -lt 30 ]; do
-  nslookup api.telegram.org >/dev/null 2>&1 && break
-  sleep 1
-  t=$((t+1))
-done
-
-if nslookup api.telegram.org >/dev/null 2>&1; then
-  log "DNS: ok after ${t}s"
-else
-  log "DNS: still broken after ${t}s, trying fallback resolvers for TG"
-  fallback=""
-  nslookup api.telegram.org 1.1.1.1 >/dev/null 2>&1 && fallback="1.1.1.1"
-  [ -z "$fallback" ] && nslookup api.telegram.org 8.8.8.8 >/dev/null 2>&1 && fallback="8.8.8.8"
-
-  if [ -n "$fallback" ]; then
-    TG_RESOLV="/tmp/kvas-sync.tg-resolv.conf"
-    printf "nameserver %s\n" "$fallback" > "$TG_RESOLV"
-    RESOLV_CONF="$TG_RESOLV"
-    export RESOLV_CONF
-    log "DNS: using fallback nameserver ${fallback} via RESOLV_CONF=${TG_RESOLV} for TG curl"
-  else
-    log "DNS: fallback resolvers also failed"
-  fi
-fi
-
-  # Для Entware: иногда curl берёт не тот resolv.conf
-  if [ -f /opt/etc/resolv.conf ]; then
-    RESOLV_CONF="/opt/etc/resolv.conf"
-    export RESOLV_CONF
-  fi
-
-  # После чистой установки сеть/DNS могут подняться не сразу → ретраи + warm-up
-  tries=5
-  delay=6
-
-  i=1
-  while [ "$i" -le "$tries" ]; do
-    nslookup api.telegram.org >/dev/null 2>&1 || true
-
-    resp="$(curl -sS -m 20 -X POST \
-      "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-      -d "chat_id=${CHAT_ID}" \
-      --data-urlencode "text=${msg}" 2>&1)" && {
-        echo "$resp" | grep -q '"ok":true' && return 0
-        log "TG: api error: $resp"
-        return 0
-      }
-
-    log "TG: send failed (try ${i}/${tries}): $resp"
-    i=$((i+1))
-    sleep "$delay"
-  done
-
-  return 0
-}
-
-render_and_send() {
-  tpl="$1"
-  tmp="$WORKDIR/tmp/tg_msg.txt"
-
-  [ -f "$tpl" ] || { log "TPL missing: $tpl"; return 0; }
-
-  cp "$tpl" "$tmp"
-
-  R_ESC="$(esc_sed "$ROUTER_NAME")"
-  L_ESC="$(esc_sed "$LINES")"
-  S_ESC="$(esc_sed "$SHA_SHOW")"
-  D_ESC="$(esc_sed "$DT")"
-  E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
-  E2_ESC="$(esc_sed "${ERR_LINES:-}")"
-
-  sed -i \
-    -e "s/{{ROUTER_NAME}}/${R_ESC}/g" \
-    -e "s/{{LINES}}/${L_ESC}/g" \
-    -e "s/{{SHA}}/${S_ESC}/g" \
-    -e "s/{{DT}}/${D_ESC}/g" \
-    -e "s/{{ERR_TITLE}}/${E1_ESC}/g" \
-    -e "s/{{ERR_LINES}}/${E2_ESC}/g" \
-    "$tmp" || true
-
-  tg_send "$(cat "$tmp")"
-}
-
-[ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
-
-mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
-
-log "start"
-DT="$(dt_ru)"
-
-rm -f "$NEW_RAW" "$NEW_NORM"
-
-if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
-  log "download failed"
-  ERR_TITLE="Ошибка загрузки"
-  ERR_LINES="• download failed"
-  render_and_send "$TPL_ERR"
-  exit 1
-fi
-
-head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
-  log "download returned HTML"
-  ERR_TITLE="Ошибка загрузки"
-  ERR_LINES="• HTML вместо списка"
-  render_and_send "$TPL_ERR"
-  exit 1
-}
-
-normalize_list "$NEW_RAW" "$NEW_NORM"
-
-LINES="$(wc -l < "$NEW_NORM" | tr -d ' ')"
-SHA="$(sha_full "$NEW_NORM")"
-SHA_SHOW="$(sha_show4 "$SHA")"
-
-if [ "$LINES" -lt "$MIN_LINES" ] || [ "$LINES" -gt "$MAX_LINES" ]; then
-  log "lines out of bounds: $LINES"
-  ERR_TITLE="Некорректный размер списка"
-  ERR_LINES="• строк: $LINES"
-  render_and_send "$TPL_ERR"
-  exit 1
-fi
-
-if [ -f "$CUR_FILE" ]; then
-  SHA_CUR="$(sha_full "$CUR_FILE")"
-else
-  SHA_CUR=""
-fi
-
-if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
-  log "SAME: normalized sha matched"
-  render_and_send "$TPL_SAME"
-  exit 0
-fi
-# --- KVAS pre-import: обновление и восстановление DNS ---
-if [ -x "$KVAS" ]; then
-  log "KVAS: update (before import)"
-  "$KVAS" update 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done || true
-
-  force_crypt_on
-
-  t=0
-  while [ "$t" -lt 30 ]; do
-    nslookup api.telegram.org >/dev/null 2>&1 && break
-    sleep 1
-    t=$((t+1))
-  done
-  log "DNS: pre-import wait finished in ${t}s"
+  # Доп. проверка резолва после поднятия dnscrypt (best-effort)
+  nslookup api.telegram.org >/dev/null 2>&1 && log "DNS: resolver ok (api.telegram.org)" || log "DNS: resolver still failing (api.telegram.org)"
 else
   log "KVAS: not found/executable at $KVAS (PATH=$PATH)"
 fi
