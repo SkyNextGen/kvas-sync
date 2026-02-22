@@ -9,9 +9,11 @@ BASE="/opt/kvas-sync"
 TMPDIR="/opt/tmp"
 CRON_LINE="15 3 * * 3 $BASE/bin/kvas-sync.sh >> $BASE/log/cron.log 2>&1"
 
-say() { printf '%s\n' "$*"; }
+# Всё (и ошибки тоже) печатаем в STDERR — чтобы в SSH не "пряталось"
+say() { printf '%s\n' "$*" >&2; }
 
 ask() {
+  # prompt — в STDERR, ввод читаем из STDIN
   printf "%s: " "$1" >&2
   IFS= read -r v || true
   printf '%s' "$v"
@@ -24,10 +26,10 @@ ask() {
 is_bad_input() {
   s="$1"
 
-  # replacement char (битая кодировка)
+  # 1) replacement char (битая кодировка)
   printf '%s' "$s" | grep -q '�' && return 0
 
-  # управляющие символы (кроме пробела/таб/перевода строки)
+  # 2) управляющие символы (кроме пробела/таб/перевода строки)
   printf '%s' "$s" | awk '
     BEGIN{bad=0}
     {
@@ -47,11 +49,17 @@ prompt_clean() {
   while :; do
     v="$(ask "$label")"
 
-    [ -n "$v" ] || { say "❌ Поле не может быть пустым."; continue; }
+    # Убираем CR (часто прилетает из терминалов/копипаста)
+    v="$(printf '%s' "$v" | tr -d '\r')"
+
+    if [ -z "$v" ]; then
+      say "❌ Поле не может быть пустым."
+      continue
+    fi
 
     if is_bad_input "$v"; then
       say "❌ Похоже, в вводе есть битые/недопустимые символы (например � или управляющие)."
-      say "   Введите заново."
+      say "   Введите заново (рекомендуется вводить вручную, без вставки)."
       continue
     fi
 
@@ -73,11 +81,19 @@ ensure_deps() {
   }
 
   opkg update >/dev/null 2>&1 || true
+
+  # пакеты: curl/unzip/timeout/iconv
+  # coreutils-timeout даёт /opt/bin/timeout
   opkg install curl unzip coreutils-timeout libiconv iconv >/dev/null 2>&1 || true
+
+  # финальная проверка (не валим установку, но будет видно)
+  command -v curl >/dev/null 2>&1 || say "⚠️ curl не найден в PATH"
+  command -v unzip >/dev/null 2>&1 || say "⚠️ unzip не найден в PATH"
+  command -v timeout >/dev/null 2>&1 || say "⚠️ timeout не найден в PATH"
 }
 
 # ------------------------------
-# DNS FIX
+# DNS FIX (для curl в Entware)
 # ------------------------------
 
 ensure_resolv() {
@@ -88,7 +104,7 @@ ensure_resolv() {
 }
 
 # ------------------------------
-# ЗАГРУЗКА REPO
+# ЗАГРУЗКА REPO (zip)
 # ------------------------------
 
 download_repo() {
@@ -108,9 +124,9 @@ download_repo() {
   PAYLOAD_DIR="$(find . -type d -name payload | head -n 1)"
   [ -n "$PAYLOAD_DIR" ] || { say "❌ payload не найден"; exit 1; }
 
-  # защита от install-stub
+  # защита от install-stub (cat > /opt/kvas-sync/bin/kvas-sync.sh)
   if grep -q 'cat > /opt/kvas-sync/bin/kvas-sync.sh' "$PAYLOAD_DIR/bin/kvas-sync.sh"; then
-    say "❌ Ошибка: в payload/bin/kvas-sync.sh найден install-stub."
+    say "❌ Ошибка: в payload/bin/kvas-sync.sh найден install-stub (cat > ...)."
     exit 1
   fi
 
@@ -142,7 +158,6 @@ write_configs() {
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
 EOF
-
   chmod 600 "$BASE/conf/secrets.conf"
 
   cat > "$BASE/conf/device.conf" <<EOF
@@ -179,11 +194,12 @@ test_run() {
   mkdir -p "$BASE/log"
   echo "===== install test run: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$INSTALL_LOG"
 
+  # Запускаем "как есть", без -x, но логируем stdout/stderr
   "$BASE/bin/kvas-sync.sh" >>"$INSTALL_LOG" 2>&1 || true
 
-  echo "----- tail install-run.log -----"
-  tail -n 200 "$INSTALL_LOG" 2>/dev/null || true
-  echo "--------------------------------"
+  say "----- tail install-run.log -----"
+  tail -n 200 "$INSTALL_LOG" 2>/dev/null >&2 || true
+  say "--------------------------------"
 
   if [ -f "$BASE/log/kvas-sync.log" ]; then
     say "✅ Агент создал kvas-sync.log"
