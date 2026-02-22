@@ -1,4 +1,8 @@
 #!/bin/sh
+
+export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+KVAS="${KVAS:-/opt/bin/kvas}"
+DIAG_LOG="${DIAG_LOG:-/opt/kvas-sync/log/diag.log}"
 set -eu
 
 # =========================
@@ -45,8 +49,25 @@ TPL_ERR="$WORKDIR/conf/tg_err.tpl"
 ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
-log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
+log() {
+  # Пишем в консоль (SSH), в основной лог и в диагностический лог.
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  line="[$ts] $*"
 
+  # stdout (видно при ручном запуске через SSH)
+  echo "$line"
+
+  # основной лог (если задан)
+  if [ -n "${LOG_FILE:-}" ]; then
+    printf "%s\n" "$line" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+
+  # диагностический лог (для диагностики)
+  if [ -n "${DIAG_LOG:-}" ]; then
+    mkdir -p "$(dirname "$DIAG_LOG")" 2>/dev/null || true
+    printf "%s\n" "$line" >> "$DIAG_LOG" 2>/dev/null || true
+  fi
+}
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
@@ -87,10 +108,51 @@ tg_send() {
     return 0
   fi
 
+
+  # KVAS: после kvas update иногда ломается DNS-резолв (что бьёт отправку в TG).
+  # 1) Принудительно включаем шифрование DNS (если бинарник доступен)
+  # 2) Ждём восстановления резолва до 30 секунд (выходим раньше при успехе)
+  # 3) Если локальный резолв не поднялся, используем аварийный nameserver ТОЛЬКО для curl в TG
+  if [ -x "$KVAS" ]; then
+    log "KVAS: crypt on (before TG)"
+    "$KVAS" crypt on 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done
+  else
+    log "KVAS: not found/executable at $KVAS (PATH=$PATH)"
+  fi
+
+  t=0
+  while [ "$t" -lt 30 ]; do
+    nslookup api.telegram.org >/dev/null 2>&1 && break
+    sleep 1
+    t=$((t+1))
+  done
+
+  if nslookup api.telegram.org >/dev/null 2>&1; then
+    log "DNS: ok after ${t}s"
+  else
+    log "DNS: still broken after ${t}s, trying fallback resolvers for TG"
+    # Пробуем публичные DNS, чтобы хотя бы уведомление ушло
+    fallback=""
+    nslookup api.telegram.org 1.1.1.1 >/dev/null 2>&1 && fallback="1.1.1.1"
+    [ -z "$fallback" ] && nslookup api.telegram.org 8.8.8.8 >/dev/null 2>&1 && fallback="8.8.8.8"
+
+    if [ -n "$fallback" ]; then
+      TG_RESOLV="/tmp/kvas-sync.tg-resolv.conf"
+      printf "nameserver %s
+" "$fallback" > "$TG_RESOLV"
+      RESOLV_CONF="$TG_RESOLV"
+      export RESOLV_CONF
+      log "DNS: using fallback nameserver ${fallback} via RESOLV_CONF=${TG_RESOLV} for TG curl"
+    else
+      log "DNS: fallback resolvers also failed"
+    fi
+  fi
+
+
 # KVAS: после kvas update иногда падает DNS-шифрование.
 # Принудительно включаем перед отправкой в TG и даём время примениться.
 if command -v kvas >/dev/null 2>&1; then
-  kvas crypt on >/dev/null 2>&1 || true
+  kvas crypt on || true
 fi
 
 # Таймаут перед отправкой (по требованию)
