@@ -1,9 +1,6 @@
 #!/bin/sh
 set -eu
 
-# Ensure Entware binaries are visible in non-interactive shells (install/cron)
-export PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
-
 # =========================
 # KVAS-SYNC Router Agent
 # =========================
@@ -25,160 +22,114 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 
 : "${MIN_LINES:=200}"
 : "${MAX_LINES:=3500}"
+
 : "${CURL_TIMEOUT:=25}"
 : "${PING_URL:=https://raw.githubusercontent.com/}"
 : "${RETRY_COUNT:=3}"
 : "${RETRY_DELAY:=8}"
+
 : "${IMPORT_TIMEOUT:=2700}"
+
+mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp"
+
+LOCK_DIR="$STATE_DIR/import.lock"
+
+NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
+NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
+CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
 
 TPL_OK="$WORKDIR/conf/tg_ok.tpl"
 TPL_SAME="$WORKDIR/conf/tg_same.tpl"
 TPL_ERR="$WORKDIR/conf/tg_err.tpl"
 
-NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
-NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
-CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
-LOCK_DIR="$STATE_DIR/import.lock"
-
-RESOLV_FILE="/opt/etc/resolv.conf"
-RESOLV_CONTENT="nameserver 127.0.0.1"
-
-# Prefer explicit Entware kvas path when available
-KVAS_BIN=""
-if [ -x /opt/bin/kvas ]; then
-  KVAS_BIN="/opt/bin/kvas"
-elif command -v kvas >/dev/null 2>&1; then
-  KVAS_BIN="$(command -v kvas)"
-fi
-
-# -------------------------
-# Utils
-# -------------------------
-
-ts() { date '+%Y-%m-%d %H:%M:%S'; }
+ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
 log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
+
+esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
 
 sha_show4() {
   h="$1"
-  a="$(printf '%s' "$h" | cut -c1-4)"
-  b="$(printf '%s' "$h" | cut -c61-64)"
-  printf '%s…%s' "$a" "$b"
+  printf "%s…%s" "$(printf '%s' "$h" | cut -c1-4)" "$(printf '%s' "$h" | cut -c61-64)"
 }
 
 normalize_list() {
-  sed 's/\r$//' "$1" \
+  in="$1"; out="$2"
+  sed 's/\r$//' "$in" \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | sed '/^$/d' \
-    | sort -u > "$2"
+    | sort -u > "$out"
 }
 
-# -------------------------
-# DNS / KVAS Recovery
-# -------------------------
-
-ensure_resolv_for_curl() {
-  mkdir -p /opt/etc 2>/dev/null || true
-  if [ ! -s "$RESOLV_FILE" ]; then
-    printf "%s\n" "$RESOLV_CONTENT" > "$RESOLV_FILE" 2>/dev/null || true
-  fi
-}
-
-curl_tg() {
-  ensure_resolv_for_curl
-  RESOLV_CONF="$RESOLV_FILE" curl "$@"
-}
-
-kvas_crypt_is_off() {
-  [ -n "$KVAS_BIN" ] || return 1
-  # Output is a table; robust match
-  "$KVAS_BIN" crypt 2>/dev/null | tr -d '\r' | grep -qi 'ОТКЛЮЧЕНО'
-}
-
-ensure_kvas_crypt_on() {
-  [ -n "$KVAS_BIN" ] || return 0
-  if kvas_crypt_is_off; then
-    log "KVAS: DNS crypt OFF -> enabling"
-    "$KVAS_BIN" crypt on >/dev/null 2>&1 || true
-    sleep 2
-  fi
-}
-
-dns_ok() {
-  nslookup api.telegram.org >/dev/null 2>&1 && return 0
-  curl -fsSL --max-time 10 "$PING_URL" >/dev/null 2>&1 && return 0
-  return 1
-}
-
-post_kvas_dns_recover() {
-  ensure_kvas_crypt_on
-  i=1
-  while [ "$i" -le 5 ]; do
-    dns_ok && { log "DNS: ok (try $i/5)"; return 0; }
-    log "DNS: still bad (try $i/5)"
-    ensure_kvas_crypt_on
-    sleep 3
-    i=$((i+1))
+download_with_retry() {
+  url="$1"; out="$2"
+  n=1
+  while [ "$n" -le "$RETRY_COUNT" ]; do
+    curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
+    if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
+      return 0
+    fi
+    log "download retry $n/$RETRY_COUNT failed"
+    n=$((n+1))
+    sleep "$RETRY_DELAY"
   done
   return 1
 }
-
-# -------------------------
-# Telegram send
-# -------------------------
 
 tg_send() {
   msg="$1"
 
-  [ -n "${BOT_TOKEN:-}" ] || { log "TG: no token"; return 0; }
-  [ -n "${CHAT_ID:-}" ] || { log "TG: no chat_id"; return 0; }
+  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+    log "TG: skip (no token/chat_id)"
+    return 0
+  fi
 
-  # KEY: recover KVAS DNS crypto + DNS sanity right before TG
-  post_kvas_dns_recover || log "DNS: recovery failed before TG"
+  # Для Entware: иногда curl берёт не тот resolv.conf
+  if [ -f /opt/etc/resolv.conf ]; then
+    RESOLV_CONF="/opt/etc/resolv.conf"
+    export RESOLV_CONF
+  fi
 
-  api="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+  # После чистой установки сеть/DNS могут подняться не сразу → ретраи + warm-up
+  tries=5
+  delay=6
 
-  t=1
-  while [ "$t" -le 5 ]; do
-    resp="$(curl_tg -sS -X POST "$api" \
+  i=1
+  while [ "$i" -le "$tries" ]; do
+    nslookup api.telegram.org >/dev/null 2>&1 || true
+
+    resp="$(curl -sS -m 20 -X POST \
+      "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
       -d "chat_id=${CHAT_ID}" \
-      --data-urlencode "text=${msg}" 2>&1)" && rc=0 || rc=$?
+      --data-urlencode "text=${msg}" 2>&1)" && {
+        echo "$resp" | grep -q '"ok":true' && return 0
+        log "TG: api error: $resp"
+        return 0
+      }
 
-    if [ "$rc" -eq 0 ]; then
-      echo "$resp" | grep -q '"ok":true' && { log "TG: sent"; return 0; }
-      log "TG: api error: $resp"
-      return 1
-    fi
-
-    log "TG: send failed (try $t/5): $resp"
-    t=$((t+1))
-    sleep 6
+    log "TG: send failed (try ${i}/${tries}): $resp"
+    i=$((i+1))
+    sleep "$delay"
   done
 
-  return 1
+  return 0
 }
-
-# -------------------------
-# Template
-# -------------------------
-
-esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
 render_and_send() {
   tpl="$1"
   tmp="$WORKDIR/tmp/tg_msg.txt"
 
-  [ -f "$tpl" ] || { log "TG: template missing"; return 1; }
+  [ -f "$tpl" ] || { log "TPL missing: $tpl"; return 0; }
 
   cp "$tpl" "$tmp"
 
   R_ESC="$(esc_sed "$ROUTER_NAME")"
-  L_ESC="$(esc_sed "${LINES:-}")"
-  S_ESC="$(esc_sed "${SHA_SHOW:-}")"
-  D_ESC="$(esc_sed "${DT:-}")"
+  L_ESC="$(esc_sed "$LINES")"
+  S_ESC="$(esc_sed "$SHA_SHOW")"
+  D_ESC="$(esc_sed "$DT")"
   E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
   E2_ESC="$(esc_sed "${ERR_LINES:-}")"
 
@@ -189,64 +140,29 @@ render_and_send() {
     -e "s/{{DT}}/${D_ESC}/g" \
     -e "s/{{ERR_TITLE}}/${E1_ESC}/g" \
     -e "s/{{ERR_LINES}}/${E2_ESC}/g" \
-    "$tmp" 2>/dev/null || true
+    "$tmp" || true
 
-  tg_send "$(cat "$tmp")" || true
+  tg_send "$(cat "$tmp")"
 }
-
-# -------------------------
-# Cleanup / EXIT hook
-# -------------------------
-
-cleanup() {
-  # Always release lock
-  rm -rf "$LOCK_DIR" 2>/dev/null || true
-
-  # Important: KVAS may drop DNS crypto at the end of update/import.
-  # Ensure crypto is ON at script end (best-effort).
-  ensure_kvas_crypt_on || true
-}
-trap cleanup EXIT INT TERM
-
-# -------------------------
-# Main
-# -------------------------
 
 [ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
 
-mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp" 2>/dev/null || true
-
-# Create log file if missing
-: > "$LOG_FILE" 2>/dev/null || true
-
 mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 log "start"
-log "PATH=$PATH"
-[ -n "$KVAS_BIN" ] && log "KVAS_BIN=$KVAS_BIN" || log "KVAS_BIN=none"
-
 DT="$(dt_ru)"
 
-rm -f "$NEW_RAW" "$NEW_NORM" 2>/dev/null || true
+rm -f "$NEW_RAW" "$NEW_NORM"
 
-# download with retry
-n=1
-while [ "$n" -le "$RETRY_COUNT" ]; do
-  curl -fsSL --max-time "$CURL_TIMEOUT" "$LIST_URL" -o "$NEW_RAW" && break
-  log "download try $n failed"
-  n=$((n+1))
-  sleep "$RETRY_DELAY"
-done
-
-[ -f "$NEW_RAW" ] || {
+if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
   log "download failed"
   ERR_TITLE="Ошибка загрузки"
   ERR_LINES="• download failed"
   render_and_send "$TPL_ERR"
   exit 1
-}
+fi
 
-# HTML guard
 head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
   log "download returned HTML"
   ERR_TITLE="Ошибка загрузки"
@@ -277,28 +193,19 @@ fi
 
 if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
   log "SAME: normalized sha matched"
-  # Even for SAME, run recovery once (KVAS might have been touched elsewhere)
-  post_kvas_dns_recover || true
   render_and_send "$TPL_SAME"
   exit 0
 fi
 
-# import
 if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
   cp "$NEW_NORM" "$CUR_FILE"
   log "IMPORT OK"
+  render_and_send "$TPL_OK"
 else
   log "IMPORT FAILED"
   ERR_TITLE="Ошибка импорта"
   ERR_LINES="• команда: $IMPORT_CMD"
-  # try to recover DNS before error TG
-  post_kvas_dns_recover || true
   render_and_send "$TPL_ERR"
-  exit 1
 fi
 
-# After import/update: recover DNS crypto before OK telegram
-post_kvas_dns_recover || log "DNS: recovery failed after import"
-
-render_and_send "$TPL_OK"
 exit 0
