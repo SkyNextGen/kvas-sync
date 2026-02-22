@@ -28,36 +28,52 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 : "${RETRY_COUNT:=3}"
 : "${RETRY_DELAY:=8}"
 
+: "${KVAS_UPDATE_TIMEOUT:=900}"
+: "${KVAS_UPDATE_RETRY:=2}"
+
 : "${IMPORT_TIMEOUT:=2700}"
-
-mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp"
-
-LOCK_DIR="$STATE_DIR/import.lock"
-
-NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
-NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
-CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
 
 TPL_OK="$WORKDIR/conf/tg_ok.tpl"
 TPL_SAME="$WORKDIR/conf/tg_same.tpl"
 TPL_ERR="$WORKDIR/conf/tg_err.tpl"
 
-ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
+NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
+CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
+LOCK_DIR="$STATE_DIR/import.lock"
+
+# TG / DNS
+RESOLV_FILE="/opt/etc/resolv.conf"
+# Можно поменять на публичные DNS, если 127.0.0.1 у вас вдруг не работает:
+# RESOLV_CONTENT="nameserver 1.1.1.1\nnameserver 8.8.8.8"
+RESOLV_CONTENT="nameserver 127.0.0.1"
+
+# -------------------------
+# utils
+# -------------------------
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
-log() { echo "[$(ts)] $*" >> "$LOG_FILE"; }
+log() {
+  echo "[$(ts)] $*" >> "$LOG_FILE"
+}
 
-esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
-
-sha_full() { sha256sum "$1" | awk '{print $1}'; }
+sha_full() {
+  sha256sum "$1" | awk '{print $1}'
+}
 
 sha_show4() {
   h="$1"
-  printf "%s…%s" "$(printf '%s' "$h" | cut -c1-4)" "$(printf '%s' "$h" | cut -c61-64)"
+  a="$(printf '%s' "$h" | cut -c1-4)"
+  b="$(printf '%s' "$h" | cut -c61-64)"
+  printf '%s…%s' "$a" "$b"
 }
 
 normalize_list() {
-  in="$1"; out="$2"
+  in="$1"
+  out="$2"
+  # trim, remove CR, drop empty, uniq
   sed 's/\r$//' "$in" \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | sed '/^$/d' \
@@ -65,71 +81,102 @@ normalize_list() {
 }
 
 download_with_retry() {
-  url="$1"; out="$2"
+  url="$1"
+  out="$2"
+
   n=1
   while [ "$n" -le "$RETRY_COUNT" ]; do
+    # ping check (helps to warm up DNS/route)
     curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
-    if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
+
+    if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out" >/dev/null 2>&1; then
       return 0
     fi
-    log "download retry $n/$RETRY_COUNT failed"
+    log "download try $n/$RETRY_COUNT failed"
     n=$((n+1))
     sleep "$RETRY_DELAY"
   done
   return 1
 }
 
+# -------------------------
+# DNS fix for Entware curl
+# -------------------------
+
+ensure_resolv_for_curl() {
+  # Entware curl иногда не видит /etc/resolv.conf (там бывает только options),
+  # поэтому создаём /opt/etc/resolv.conf и используем через RESOLV_CONF.
+  mkdir -p /opt/etc 2>/dev/null || true
+  if [ ! -s "$RESOLV_FILE" ]; then
+    # shell-safe write
+    printf "%s\n" "$RESOLV_CONTENT" > "$RESOLV_FILE" 2>/dev/null || true
+  fi
+}
+
+curl_tg() {
+  # Используем RESOLV_CONF принудительно
+  ensure_resolv_for_curl
+  RESOLV_CONF="$RESOLV_FILE" curl "$@"
+}
+
+# -------------------------
+# Telegram send (with retry)
+# -------------------------
+
 tg_send() {
   msg="$1"
 
-  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-    log "TG: skip (no token/chat_id)"
-    return 0
-  fi
+  [ -n "${BOT_TOKEN:-}" ] || { log "TG: skip (no token)"; return 0; }
+  [ -n "${CHAT_ID:-}" ] || { log "TG: skip (no chat_id)"; return 0; }
 
-  # Для Entware: иногда curl берёт не тот resolv.conf
-  if [ -f /opt/etc/resolv.conf ]; then
-    RESOLV_CONF="/opt/etc/resolv.conf"
-    export RESOLV_CONF
-  fi
+  # Небольшая пауза на “прогрев” DNS/маршрута (особенно сразу после install)
+  sleep 2
 
-  # После чистой установки сеть/DNS могут подняться не сразу → ретраи + warm-up
-  tries=5
-  delay=6
+  api="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
 
-  i=1
-  while [ "$i" -le "$tries" ]; do
-    nslookup api.telegram.org >/dev/null 2>&1 || true
-
-    resp="$(curl -sS -m 20 -X POST \
-      "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  t=1
+  while [ "$t" -le 5 ]; do
+    # пишем ответ в переменную, чтобы залогировать
+    resp="$(curl_tg -sS -X POST "$api" \
       -d "chat_id=${CHAT_ID}" \
-      --data-urlencode "text=${msg}" 2>&1)" && {
-        echo "$resp" | grep -q '"ok":true' && return 0
-        log "TG: api error: $resp"
-        return 0
-      }
+      --data-urlencode "text=${msg}" 2>&1)" && rc=0 || rc=$?
 
-    log "TG: send failed (try ${i}/${tries}): $resp"
-    i=$((i+1))
-    sleep "$delay"
+    if [ "$rc" -eq 0 ]; then
+      # ok:true?
+      echo "$resp" | grep -q '"ok":true' && { log "TG: sent"; return 0; }
+      log "TG: api error: $resp"
+      return 1
+    fi
+
+    log "TG: send failed (try $t/5): $resp"
+    t=$((t+1))
+    sleep 6
   done
 
-  return 0
+  return 1
+}
+
+# -------------------------
+# template render
+# -------------------------
+
+esc_sed() {
+  # escape / & \ for sed replacement
+  printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'
 }
 
 render_and_send() {
   tpl="$1"
   tmp="$WORKDIR/tmp/tg_msg.txt"
 
-  [ -f "$tpl" ] || { log "TPL missing: $tpl"; return 0; }
+  [ -f "$tpl" ] || { log "TG: template missing: $tpl"; return 1; }
 
   cp "$tpl" "$tmp"
 
   R_ESC="$(esc_sed "$ROUTER_NAME")"
-  L_ESC="$(esc_sed "$LINES")"
-  S_ESC="$(esc_sed "$SHA_SHOW")"
-  D_ESC="$(esc_sed "$DT")"
+  L_ESC="$(esc_sed "${LINES:-}")"
+  S_ESC="$(esc_sed "${SHA_SHOW:-}")"
+  D_ESC="$(esc_sed "${DT:-}")"
   E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
   E2_ESC="$(esc_sed "${ERR_LINES:-}")"
 
@@ -140,12 +187,19 @@ render_and_send() {
     -e "s/{{DT}}/${D_ESC}/g" \
     -e "s/{{ERR_TITLE}}/${E1_ESC}/g" \
     -e "s/{{ERR_LINES}}/${E2_ESC}/g" \
-    "$tmp" || true
+    "$tmp" 2>/dev/null || true
 
-  tg_send "$(cat "$tmp")"
+  tg_send "$(cat "$tmp")" || true
 }
 
+# -------------------------
+# main
+# -------------------------
+
 [ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
+
+mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp" 2>/dev/null || true
+: > "$LOG_FILE" 2>/dev/null || true
 
 mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
@@ -153,7 +207,7 @@ trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 log "start"
 DT="$(dt_ru)"
 
-rm -f "$NEW_RAW" "$NEW_NORM"
+rm -f "$NEW_RAW" "$NEW_NORM" 2>/dev/null || true
 
 if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
   log "download failed"
@@ -163,6 +217,7 @@ if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
   exit 1
 fi
 
+# защита: если скачали HTML вместо списка
 head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
   log "download returned HTML"
   ERR_TITLE="Ошибка загрузки"
@@ -197,6 +252,7 @@ if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
   exit 0
 fi
 
+# import
 if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
   cp "$NEW_NORM" "$CUR_FILE"
   log "IMPORT OK"
