@@ -87,6 +87,23 @@ tg_send() {
     return 0
   fi
 
+# KVAS: после kvas update иногда падает DNS-шифрование.
+# Принудительно включаем перед отправкой в TG и даём время примениться.
+if command -v kvas >/dev/null 2>&1; then
+  kvas crypt on >/dev/null 2>&1 || true
+fi
+
+# Таймаут перед отправкой (по требованию)
+# Ставим ДО ретраев, чтобы не умножать задержку на каждую попытку.
+# Ожидание восстановления DNS после kvas update/crypt on.
+# Ждём до 30 секунд, выходим раньше при успешном резолве.
+t=0
+while [ "$t" -lt 30 ]; do
+  nslookup api.telegram.org >/dev/null 2>&1 && break
+  sleep 1
+  t=$((t+1))
+done
+
   # Для Entware: иногда curl берёт не тот resolv.conf
   if [ -f /opt/etc/resolv.conf ]; then
     RESOLV_CONF="/opt/etc/resolv.conf"
