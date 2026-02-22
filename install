@@ -9,7 +9,7 @@ BASE="/opt/kvas-sync"
 TMPDIR="/opt/tmp"
 CRON_LINE="15 3 * * 3 $BASE/bin/kvas-sync.sh >> $BASE/log/cron.log 2>&1"
 
-# Всё (и ошибки тоже) печатаем в STDERR — чтобы в SSH не "пряталось"
+# Всё печатаем в STDERR — чтобы в SSH не "пряталось"
 say() { printf '%s\n' "$*" >&2; }
 
 ask() {
@@ -20,28 +20,20 @@ ask() {
 }
 
 # ------------------------------
-# ВАЛИДАЦИЯ ВВОДА
+# ВАЛИДАЦИЯ ВВОДА (байтовая)
 # ------------------------------
 
-is_bad_input() {
+has_replacement_char() {
+  # ловим символ � (U+FFFD)
+  printf '%s' "$1" | grep -q '�'
+}
+
+has_control_bytes() {
+  # байтовая проверка: если после удаления control-байтов строка изменилась — значит control были
+  # удаляем: 0x00-0x08, 0x0B,0x0C, 0x0E-0x1F, 0x7F
   s="$1"
-
-  # 1) replacement char (битая кодировка)
-  printf '%s' "$s" | grep -q '�' && return 0
-
-  # 2) управляющие символы (кроме пробела/таб/перевода строки)
-  printf '%s' "$s" | awk '
-    BEGIN{bad=0}
-    {
-      for(i=1;i<=length($0);i++){
-        c=substr($0,i,1)
-        if (c ~ /[[:cntrl:]]/ && c != "\t" && c != "\n" && c != "\r") bad=1
-      }
-    }
-    END{exit bad}
-  ' && return 0
-
-  return 1
+  cleaned="$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+  [ "$cleaned" != "$s" ]
 }
 
 prompt_clean() {
@@ -57,13 +49,37 @@ prompt_clean() {
       continue
     fi
 
-    if is_bad_input "$v"; then
+    if has_replacement_char "$v" || has_control_bytes "$v"; then
       say "❌ Похоже, в вводе есть битые/недопустимые символы (например � или управляющие)."
       say "   Введите заново (рекомендуется вводить вручную, без вставки)."
       continue
     fi
 
     printf '%s' "$v"
+    return 0
+  done
+}
+
+prompt_bot_token() {
+  while :; do
+    t="$(prompt_clean "Токен бота")"
+    echo "$t" | grep -Eq '^[0-9]+:[A-Za-z0-9_-]+$' || {
+      say "❌ Токен выглядит неверно. Формат: 123456:ABCdef_-..."
+      continue
+    }
+    printf '%s' "$t"
+    return 0
+  done
+}
+
+prompt_chat_id() {
+  while :; do
+    c="$(prompt_clean "ID чата")"
+    echo "$c" | grep -Eq '^-?[0-9]+$' || {
+      say "❌ ID чата должен быть числом (например 947..., либо -100...)."
+      continue
+    }
+    printf '%s' "$c"
     return 0
   done
 }
@@ -82,11 +98,9 @@ ensure_deps() {
 
   opkg update >/dev/null 2>&1 || true
 
-  # пакеты: curl/unzip/timeout/iconv
-  # coreutils-timeout даёт /opt/bin/timeout
+  # curl/unzip/timeout/iconv
   opkg install curl unzip coreutils-timeout libiconv iconv >/dev/null 2>&1 || true
 
-  # финальная проверка (не валим установку, но будет видно)
   command -v curl >/dev/null 2>&1 || say "⚠️ curl не найден в PATH"
   command -v unzip >/dev/null 2>&1 || say "⚠️ unzip не найден в PATH"
   command -v timeout >/dev/null 2>&1 || say "⚠️ timeout не найден в PATH"
@@ -124,7 +138,7 @@ download_repo() {
   PAYLOAD_DIR="$(find . -type d -name payload | head -n 1)"
   [ -n "$PAYLOAD_DIR" ] || { say "❌ payload не найден"; exit 1; }
 
-  # защита от install-stub (cat > /opt/kvas-sync/bin/kvas-sync.sh)
+  # защита от install-stub
   if grep -q 'cat > /opt/kvas-sync/bin/kvas-sync.sh' "$PAYLOAD_DIR/bin/kvas-sync.sh"; then
     say "❌ Ошибка: в payload/bin/kvas-sync.sh найден install-stub (cat > ...)."
     exit 1
@@ -148,8 +162,8 @@ write_configs() {
   say ""
   say "Введите данные Telegram"
 
-  BOT_TOKEN="$(prompt_clean "Токен бота")"
-  CHAT_ID="$(prompt_clean "ID чата")"
+  BOT_TOKEN="$(prompt_bot_token)"
+  CHAT_ID="$(prompt_chat_id)"
   ROUTER_NAME="$(prompt_clean "Введите имя роутера")"
 
   mkdir -p "$BASE/conf"
@@ -194,7 +208,6 @@ test_run() {
   mkdir -p "$BASE/log"
   echo "===== install test run: $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$INSTALL_LOG"
 
-  # Запускаем "как есть", без -x, но логируем stdout/stderr
   "$BASE/bin/kvas-sync.sh" >>"$INSTALL_LOG" 2>&1 || true
 
   say "----- tail install-run.log -----"
