@@ -1,9 +1,13 @@
 #!/bin/sh
+set -eu
 
 export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-KVAS="${KVAS:-/opt/bin/kvas}"
+KVAS="/opt/bin/kvas"
 DIAG_LOG="${DIAG_LOG:-/opt/kvas-sync/log/diag.log}"
-set -eu
+
+# Гарантия: после любых операций (в т.ч. kvas update) возвращаем DNS-шифрование.
+# Это ловит кейс, когда update/импорт сбрасывает crypt в OFF.
+
 
 # =========================
 # KVAS-SYNC Router Agent
@@ -50,24 +54,32 @@ ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
 log() {
-  # Пишем в консоль (SSH), в основной лог и в диагностический лог.
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  line="[$ts] $*"
-
-  # stdout (видно при ручном запуске через SSH)
+  # stdout (видно при ручном запуске), основной лог и диагностический лог
+  line="[$(ts)] $*"
   echo "$line"
-
-  # основной лог (если задан)
-  if [ -n "${LOG_FILE:-}" ]; then
-    printf "%s\n" "$line" >> "$LOG_FILE" 2>/dev/null || true
-  fi
-
-  # диагностический лог (для диагностики)
+  printf "%s
+" "$line" >> "$LOG_FILE" 2>/dev/null || true
   if [ -n "${DIAG_LOG:-}" ]; then
     mkdir -p "$(dirname "$DIAG_LOG")" 2>/dev/null || true
-    printf "%s\n" "$line" >> "$DIAG_LOG" 2>/dev/null || true
+    printf "%s
+" "$line" >> "$DIAG_LOG" 2>/dev/null || true
   fi
 }
+
+force_crypt_on() {
+  # Принудительно включаем DNS-шифрование KVAS.
+  # Важно: используем абсолютный путь, чтобы работало и из cron.
+  if [ -x "$KVAS" ]; then
+    log "KVAS: force crypt on"
+    "$KVAS" crypt on 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done || true
+  else
+    log "KVAS: binary not found at $KVAS (PATH=$PATH)"
+  fi
+}
+trap force_crypt_on EXIT
+
+
+
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
@@ -107,64 +119,34 @@ tg_send() {
     log "TG: skip (no token/chat_id)"
     return 0
   fi
+  # KVAS/DNS: перед отправкой в TG принудительно включаем DNS-шифрование и ждём восстановления резолва.
+  force_crypt_on
 
-
-  # KVAS: после kvas update иногда ломается DNS-резолв (что бьёт отправку в TG).
-  # 1) Принудительно включаем шифрование DNS (если бинарник доступен)
-  # 2) Ждём восстановления резолва до 30 секунд (выходим раньше при успехе)
-  # 3) Если локальный резолв не поднялся, используем аварийный nameserver ТОЛЬКО для curl в TG
-  if [ -x "$KVAS" ]; then
-    log "KVAS: crypt on (before TG)"
-    "$KVAS" crypt on 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done
-  else
-    log "KVAS: not found/executable at $KVAS (PATH=$PATH)"
-  fi
-
-  t=0
-  while [ "$t" -lt 30 ]; do
-    nslookup api.telegram.org >/dev/null 2>&1 && break
-    sleep 1
-    t=$((t+1))
-  done
-
-  if nslookup api.telegram.org >/dev/null 2>&1; then
-    log "DNS: ok after ${t}s"
-  else
-    log "DNS: still broken after ${t}s, trying fallback resolvers for TG"
-    # Пробуем публичные DNS, чтобы хотя бы уведомление ушло
-    fallback=""
-    nslookup api.telegram.org 1.1.1.1 >/dev/null 2>&1 && fallback="1.1.1.1"
-    [ -z "$fallback" ] && nslookup api.telegram.org 8.8.8.8 >/dev/null 2>&1 && fallback="8.8.8.8"
-
-    if [ -n "$fallback" ]; then
-      TG_RESOLV="/tmp/kvas-sync.tg-resolv.conf"
-      printf "nameserver %s
-" "$fallback" > "$TG_RESOLV"
-      RESOLV_CONF="$TG_RESOLV"
-      export RESOLV_CONF
-      log "DNS: using fallback nameserver ${fallback} via RESOLV_CONF=${TG_RESOLV} for TG curl"
-    else
-      log "DNS: fallback resolvers also failed"
-    fi
-  fi
-
-
-# KVAS: после kvas update иногда падает DNS-шифрование.
-# Принудительно включаем перед отправкой в TG и даём время примениться.
-if command -v kvas >/dev/null 2>&1; then
-  kvas crypt on || true
-fi
-
-# Таймаут перед отправкой (по требованию)
-# Ставим ДО ретраев, чтобы не умножать задержку на каждую попытку.
-# Ожидание восстановления DNS после kvas update/crypt on.
-# Ждём до 30 секунд, выходим раньше при успешном резолве.
 t=0
 while [ "$t" -lt 30 ]; do
   nslookup api.telegram.org >/dev/null 2>&1 && break
   sleep 1
   t=$((t+1))
 done
+
+if nslookup api.telegram.org >/dev/null 2>&1; then
+  log "DNS: ok after ${t}s"
+else
+  log "DNS: still broken after ${t}s, trying fallback resolvers for TG"
+  fallback=""
+  nslookup api.telegram.org 1.1.1.1 >/dev/null 2>&1 && fallback="1.1.1.1"
+  [ -z "$fallback" ] && nslookup api.telegram.org 8.8.8.8 >/dev/null 2>&1 && fallback="8.8.8.8"
+
+  if [ -n "$fallback" ]; then
+    TG_RESOLV="/tmp/kvas-sync.tg-resolv.conf"
+    printf "nameserver %s\n" "$fallback" > "$TG_RESOLV"
+    RESOLV_CONF="$TG_RESOLV"
+    export RESOLV_CONF
+    log "DNS: using fallback nameserver ${fallback} via RESOLV_CONF=${TG_RESOLV} for TG curl"
+  else
+    log "DNS: fallback resolvers also failed"
+  fi
+fi
 
   # Для Entware: иногда curl берёт не тот resolv.conf
   if [ -f /opt/etc/resolv.conf ]; then
@@ -275,6 +257,25 @@ if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
   render_and_send "$TPL_SAME"
   exit 0
 fi
+# --- KVAS pre-import: обновление и восстановление DNS ---
+if [ -x "$KVAS" ]; then
+  log "KVAS: update (before import)"
+  "$KVAS" update 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done || true
+
+  force_crypt_on
+
+  t=0
+  while [ "$t" -lt 30 ]; do
+    nslookup api.telegram.org >/dev/null 2>&1 && break
+    sleep 1
+    t=$((t+1))
+  done
+  log "DNS: pre-import wait finished in ${t}s"
+else
+  log "KVAS: not found/executable at $KVAS (PATH=$PATH)"
+fi
+# -------------------------------------------------------
+
 
 if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
   cp "$NEW_NORM" "$CUR_FILE"
