@@ -94,14 +94,21 @@ ensure_dnscrypt_running() {
   # Проверяем и (при необходимости) поднимаем dnscrypt-proxy2 так, чтобы не убить DNS.
   # ВАЖНО: эта функция НЕ вызывает force_crypt_on (иначе рекурсия/цикл).
   port="${1:-9153}"
+  STARTLOG="$LOGDIR/dnscrypt-start.log"
 
   is_listening() {
-    # Проверяем и UDP, и TCP. В системном логе Keenetic чаще видно именно UDP.
-    netstat -lun 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
-    netstat -ltn 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
-    # fallback: некоторые сборки BusyBox урезают флаги
-    netstat -ln 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
+    # TCP/UDP + IPv4/IPv6
+    netstat -lun 2>/dev/null | grep -q "[:.]${port}[[:space:]]" && return 0
+    netstat -ltn 2>/dev/null | grep -q "[:.]${port}[[:space:]]" && return 0
+    netstat -ln  2>/dev/null | grep -q "[:.]${port}[[:space:]]" && return 0
     return 1
+  }
+
+  who_listens() {
+    # Пытаемся показать PID/процесс (если netstat/ss поддерживают -p)
+    (netstat -lntp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
+    (netstat -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
+    (ss -lntup 2>/dev/null  | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
   }
 
   if is_listening; then
@@ -109,18 +116,22 @@ ensure_dnscrypt_running() {
     return 0
   fi
 
+  # 1) если процесс есть, но порт не виден — фиксируем и пробуем мягко перезапустить
   if pidof dnscrypt-proxy >/dev/null 2>&1; then
-    log "DNSCRYPT: process exists, but :${port} not visible yet (waiting)"
-  else
-    log "DNSCRYPT: process not running, starting via init.d"
+    log "DNSCRYPT: process exists, but :${port} not visible; restarting"
+    log "DNSCRYPT: listeners before restart: $(who_listens | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g')"
+    /opt/etc/init.d/S09dnscrypt-proxy2 stop >/dev/null 2>&1 || true
+    killall dnscrypt-proxy >/dev/null 2>&1 || true
+    sleep 1
   fi
 
-  if [ -x /opt/etc/init.d/S09dnscrypt-proxy2 ]; then
-    sh -x /opt/etc/init.d/S09dnscrypt-proxy2 restart >/tmp/dnscrypt-proxy2.restart.log 2>&1 || true
-  else
-    log "DNSCRYPT: init script missing: /opt/etc/init.d/S09dnscrypt-proxy2"
-  fi
+  # 2) стартуем через init.d и забираем stderr/stdout в лог (иначе 'Failed to start...' без причины)
+  log "DNSCRYPT: starting via init.d (capturing to $STARTLOG)"
+  : > "$STARTLOG" 2>/dev/null || true
+  sh -x /opt/etc/init.d/S09dnscrypt-proxy2 start >>"$STARTLOG" 2>&1 || true
 
+  # 3) ждём появления слушателя; если не поднялся — в лог выведем кто занял порт + хвост startlog
   i=0
   while [ "$i" -lt 20 ]; do
     is_listening && { log "DNSCRYPT: up after ${i}s"; return 0; }
@@ -129,9 +140,11 @@ ensure_dnscrypt_running() {
   done
 
   log "DNSCRYPT: still NOT listening on :${port} after ${i}s"
-  if [ -f /tmp/dnscrypt-proxy2.restart.log ]; then
-    tail -n 30 /tmp/dnscrypt-proxy2.restart.log 2>/dev/null | while IFS= read -r l; do log "DNSCRYPT: $l"; done || true
-  fi
+  log "DNSCRYPT: listeners now: $(who_listens | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g')"
+  log "DNSCRYPT: startlog tail:"
+  tail -n 80 "$STARTLOG" 2>/dev/null | sed 's/^/DNSCRYPT-LOG: /' | while IFS= read -r l; do log "$l"; done
+
   return 1
 }
 
