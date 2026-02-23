@@ -91,28 +91,50 @@ force_crypt_on() {
 
 
 ensure_dnscrypt_running() {
-  # dnsmasq обычно использует локальный dnscrypt-proxy (порт 9153).
-  # После `kvas update` dnscrypt может не подняться автоматически: тогда "умирает" весь DNS.
+  # Проверяем и (при необходимости) поднимаем dnscrypt-proxy2 так, чтобы не убить DNS.
+  # ВАЖНО: эта функция НЕ вызывает force_crypt_on (иначе рекурсия/цикл).
   port="${1:-9153}"
 
-  if netstat -ln 2>/dev/null | grep -q ":${port}"; then
+  is_listening() {
+    # Проверяем и UDP, и TCP. В системном логе Keenetic чаще видно именно UDP.
+    netstat -lun 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
+    netstat -ltn 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
+    # fallback: некоторые сборки BusyBox урезают флаги
+    netstat -ln 2>/dev/null | grep -q ":${port}[[:space:]]" && return 0
+    return 1
+  }
+
+  if is_listening; then
     log "DNSCRYPT: already listening on :${port}"
     return 0
   fi
 
-  log "DNSCRYPT: not listening on :${port}, forcing start via KVAS (crypt on)"
-  force_crypt_on
+  if pidof dnscrypt-proxy >/dev/null 2>&1; then
+    log "DNSCRYPT: process exists, but :${port} not visible yet (waiting)"
+  else
+    log "DNSCRYPT: process not running, starting via init.d"
+  fi
+
+  if [ -x /opt/etc/init.d/S09dnscrypt-proxy2 ]; then
+    sh -x /opt/etc/init.d/S09dnscrypt-proxy2 restart >/tmp/dnscrypt-proxy2.restart.log 2>&1 || true
+  else
+    log "DNSCRYPT: init script missing: /opt/etc/init.d/S09dnscrypt-proxy2"
+  fi
 
   i=0
-  while [ "$i" -lt 10 ]; do
-    netstat -ln 2>/dev/null | grep -q ":${port}" && { log "DNSCRYPT: up after ${i}s"; return 0; }
+  while [ "$i" -lt 20 ]; do
+    is_listening && { log "DNSCRYPT: up after ${i}s"; return 0; }
     sleep 1
     i=$((i+1))
   done
 
   log "DNSCRYPT: still NOT listening on :${port} after ${i}s"
+  if [ -f /tmp/dnscrypt-proxy2.restart.log ]; then
+    tail -n 30 /tmp/dnscrypt-proxy2.restart.log 2>/dev/null | while IFS= read -r l; do log "DNSCRYPT: $l"; done || true
+  fi
   return 1
 }
+
 cleanup() {
   # Всегда снимаем lock и восстанавливаем DNS-шифрование (best-effort).
   rm -rf "$LOCK_DIR" 2>/dev/null || true
