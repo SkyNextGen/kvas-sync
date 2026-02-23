@@ -67,11 +67,12 @@ log() {
 }
 
 force_crypt_on() {
-  # Принудительно включаем DNS-шифрование KVAS.
-  # Важно: избегаем pipe-режима (stdout не TTY), т.к. KVAS может менять поведение.
+  # Принудительно включаем DNS-шифрование KVAS в "cron-like" режиме:
+  # - stdin из /dev/null (без ввода)
+  # - вывод пишем во временный файл, чтобы KVAS не работал в pipe-режиме
   if [ -x "$KVAS" ]; then
     log "KVAS: force crypt on"
-    tmp="${WORKDIR:-/tmp}/kvas-crypt.on.$$.$RANDOM.log"
+    tmp="$WORKDIR/tmp/kvas-crypt.on.log"
     : >"$tmp" 2>/dev/null || true
 
     "$KVAS" crypt on </dev/null >"$tmp" 2>&1 || true
@@ -79,11 +80,14 @@ force_crypt_on() {
     while IFS= read -r line; do
       log "KVAS: $line"
     done < "$tmp" || true
-    rm -f "$tmp" 2>/dev/null || true
+
+    # Доп. проверка: поднялся ли локальный dnscrypt (порт 9153)
+    ensure_dnscrypt_running 9153 || true
   else
     log "KVAS: binary not found at $KVAS (PATH=$PATH)"
   fi
 }
+
 
 
 ensure_dnscrypt_running() {
@@ -109,16 +113,11 @@ ensure_dnscrypt_running() {
   log "DNSCRYPT: still NOT listening on :${port} after ${i}s"
   return 1
 }
-
-
 cleanup() {
-  # Один общий trap: не теряем ни очистку lock, ни восстановление crypt.
-  # NB: set -u включён, поэтому используем ${VAR:-}.
-  [ -n "${LOCK_DIR:-}" ] && rm -rf "${LOCK_DIR:-}" 2>/dev/null || true
-  force_crypt_on
+  # Всегда снимаем lock и восстанавливаем DNS-шифрование (best-effort).
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+  force_crypt_on || true
 }
-
-trap cleanup EXIT INT TERM
 
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
@@ -259,6 +258,7 @@ render_and_send() {
 [ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
 
 mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+trap cleanup EXIT INT TERM
 log "start"
 DT="$(dt_ru)"
 
@@ -308,16 +308,13 @@ fi
 # --- KVAS pre-import: обновление KVAS и восстановление DNS ---
 if [ -x "$KVAS" ]; then
   log "KVAS: update (before import)"
-  tmp_up="$WORKDIR/tmp/kvas-update.log"
-  : >"$tmp_up" 2>/dev/null || true
-  "$KVAS" update </dev/null >"$tmp_up" 2>&1 || true
-  while IFS= read -r line; do log "KVAS: $line"; done < "$tmp_up" || true
-  rm -f "$tmp_up" 2>/dev/null || true
-  # После update KVAS может не поднять dnscrypt автоматически — поднимаем принудительно.
-  ensure_dnscrypt_running 9153 || true
-
-  # На всякий случай ещё раз фиксируем состояние шифрования
+  tmpu="$WORKDIR/tmp/kvas-update.log"
+  : >"$tmpu" 2>/dev/null || true
+  "$KVAS" update </dev/null >"$tmpu" 2>&1 || true
+  while IFS= read -r line; do log "KVAS: $line"; done < "$tmpu" || true
+  # После update KVAS может сбросить DNS: фиксируем шифрование и поднимаем dnscrypt.
   force_crypt_on
+  ensure_dnscrypt_running 9153 || true
 
   # Best-effort проверка прикладного резолва (важно для TG)
   if nslookup api.telegram.org >/dev/null 2>&1; then
@@ -331,8 +328,9 @@ fi
 # -------------------------------------------------------
 
 if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
-  cp "$NEW_NORM" "$CUR_FILE"
-  log "IMPORT OK"
+  cp "$NEW_NORM" "$CUR_FILE"  log "IMPORT OK"
+  # После импорта KVAS/перезапусков DNS иногда "сбрасывается" crypt — фиксируем ещё раз перед TG.
+  force_crypt_on || true
   render_and_send "$TPL_OK"
 else
   log "IMPORT FAILED"
