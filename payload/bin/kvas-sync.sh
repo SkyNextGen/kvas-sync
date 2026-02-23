@@ -68,10 +68,18 @@ log() {
 
 force_crypt_on() {
   # Принудительно включаем DNS-шифрование KVAS.
-  # Важно: используем абсолютный путь, чтобы работало и из cron.
+  # Важно: избегаем pipe-режима (stdout не TTY), т.к. KVAS может менять поведение.
   if [ -x "$KVAS" ]; then
     log "KVAS: force crypt on"
-    "$KVAS" crypt on 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done || true
+    tmp="${WORKDIR:-/tmp}/kvas-crypt.on.$$.$RANDOM.log"
+    : >"$tmp" 2>/dev/null || true
+
+    "$KVAS" crypt on </dev/null >"$tmp" 2>&1 || true
+
+    while IFS= read -r line; do
+      log "KVAS: $line"
+    done < "$tmp" || true
+    rm -f "$tmp" 2>/dev/null || true
   else
     log "KVAS: binary not found at $KVAS (PATH=$PATH)"
   fi
@@ -102,9 +110,15 @@ ensure_dnscrypt_running() {
   return 1
 }
 
-trap force_crypt_on EXIT
 
+cleanup() {
+  # Один общий trap: не теряем ни очистку lock, ни восстановление crypt.
+  # NB: set -u включён, поэтому используем ${VAR:-}.
+  [ -n "${LOCK_DIR:-}" ] && rm -rf "${LOCK_DIR:-}" 2>/dev/null || true
+  force_crypt_on
+}
 
+trap cleanup EXIT INT TERM
 
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
@@ -245,8 +259,6 @@ render_and_send() {
 [ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
 
 mkdir "$LOCK_DIR" 2>/dev/null || exit 0
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
-
 log "start"
 DT="$(dt_ru)"
 
@@ -296,8 +308,11 @@ fi
 # --- KVAS pre-import: обновление KVAS и восстановление DNS ---
 if [ -x "$KVAS" ]; then
   log "KVAS: update (before import)"
-  "$KVAS" update 2>&1 | while IFS= read -r line; do log "KVAS: $line"; done || true
-
+  tmp_up="$WORKDIR/tmp/kvas-update.log"
+  : >"$tmp_up" 2>/dev/null || true
+  "$KVAS" update </dev/null >"$tmp_up" 2>&1 || true
+  while IFS= read -r line; do log "KVAS: $line"; done < "$tmp_up" || true
+  rm -f "$tmp_up" 2>/dev/null || true
   # После update KVAS может не поднять dnscrypt автоматически — поднимаем принудительно.
   ensure_dnscrypt_running 9153 || true
 
