@@ -2,16 +2,16 @@
 set -eu
 
 export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# =========================
+# KVAS-SYNC Router Agent (weekly)
+# - NO: kvas update
+# - NO: kvas crypt on/off
+# - YES: weekly purge of KVAS state when list CHANGED (kvas purge)
+# - YES: Telegram notifications (OK / SAME / ERR)
+# =========================
+
 KVAS="/opt/bin/kvas"
-DIAG_LOG="${DIAG_LOG:-/opt/kvas-sync/log/diag.log}"
-
-# Гарантия: после любых операций (в т.ч. kvas update) возвращаем DNS-шифрование.
-# Это ловит кейс, когда update/импорт сбрасывает crypt в OFF.
-
-
-# =========================
-# KVAS-SYNC Router Agent (final v4)
-# =========================
 
 COMMON="/opt/kvas-sync/conf/common.conf"
 DEVICE="/opt/kvas-sync/conf/device.conf"
@@ -23,23 +23,25 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 
 : "${WORKDIR:=/opt/kvas-sync}"
 : "${STATE_DIR:=$WORKDIR/state}"
-: "${LOG_FILE:=$WORKDIR/log/kvas-sync.log}"
 : "${LOGDIR:=$WORKDIR/log}"
+: "${LOG_FILE:=$LOGDIR/kvas-sync.log}"
+
 : "${LIST_URL:=}"
 : "${ROUTER_NAME:=Router}"
 : "${IMPORT_CMD:=kvas import}"
 
 : "${MIN_LINES:=200}"
 : "${MAX_LINES:=3500}"
-
 : "${CURL_TIMEOUT:=25}"
-: "${PING_URL:=https://raw.githubusercontent.com/}"
 : "${RETRY_COUNT:=3}"
 : "${RETRY_DELAY:=8}"
-
 : "${IMPORT_TIMEOUT:=2700}"
 
-mkdir -p "$STATE_DIR" "$WORKDIR/log" "$WORKDIR/tmp"
+TPL_OK="$WORKDIR/conf/tg_ok.tpl"
+TPL_SAME="$WORKDIR/conf/tg_same.tpl"
+TPL_ERR="$WORKDIR/conf/tg_err.tpl"
+
+mkdir -p "$STATE_DIR" "$LOGDIR" "$WORKDIR/tmp"
 
 LOCK_DIR="$STATE_DIR/import.lock"
 
@@ -47,219 +49,36 @@ NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
 NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
 CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
 
-TPL_OK="$WORKDIR/conf/tg_ok.tpl"
-TPL_SAME="$WORKDIR/conf/tg_same.tpl"
-TPL_ERR="$WORKDIR/conf/tg_err.tpl"
-
 ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
 
 log() {
-  # stdout (видно при ручном запуске), основной лог и диагностический лог
   line="[$(ts)] $*"
   echo "$line"
-  printf "%s
-" "$line" >> "$LOG_FILE" 2>/dev/null || true
-  if [ -n "${DIAG_LOG:-}" ]; then
-    mkdir -p "$(dirname "$DIAG_LOG")" 2>/dev/null || true
-    printf "%s
-" "$line" >> "$DIAG_LOG" 2>/dev/null || true
-  fi
+  printf "%s\n" "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
-force_crypt_on() {
-  # Включаем DNS-шифрование KVAS в безопасном режиме (без TTY).
-  # Fail-open: если dnscrypt не поднялся — НЕ включаем crypt, чтобы не сломать DNS.
-  if [ -x "$KVAS" ]; then
-    log "KVAS: force crypt on"
+die() { log "ERROR: $*"; exit 1; }
 
-    if ! ensure_dnscrypt_running 9153; then
-      log "DNSCRYPT: not ready; skipping 'kvas crypt on' (fail-open)"
-      return 1
-    fi
-
-    tmp="$WORKDIR/tmp/kvas-crypt.on.log"
-    : >"$tmp" 2>/dev/null || true
-    "$KVAS" crypt on </dev/null >"$tmp" 2>&1 || true
-
-    while IFS= read -r line; do
-      log "KVAS: $line"
-    done < "$tmp" || true
-
-    return 0
-  fi
-
-  log "KVAS: binary not found at $KVAS (PATH=$PATH)"
-  return 1
-}
-
-
-
-ensure_dnscrypt_running() {
-  # Fail-safe проверка/старт dnscrypt-proxy2.
-  # ВАЖНО: не ломаем DNS: если dnscrypt не поднялся — просто логируем и выходим с 1.
-  port="${1:-9153}"
-  STARTLOG="$LOGDIR/dnscrypt-start.log"
-
-  mkdir -p "$LOGDIR" 2>/dev/null || true
-  : >"$STARTLOG" 2>/dev/null || true
-
-  # внутри функции отключаем 'set -e', иначе проверки/подстановки могут обрубать выполнение
-  set +e
-
-  is_listening() {
-    netstat -lun 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
-    netstat -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
-    netstat -ln  2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
-    return 1
-  }
-
-  who_listens() {
-    (netstat -lntp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
-    (netstat -lunp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
-    if command -v ss >/dev/null 2>&1; then
-      (ss -lntup 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true) | tail -n 3
-    fi
-  }
-
-  if is_listening; then
-    log "DNSCRYPT: already listening on :${port}"
-    set -e
-    return 0
-  fi
-
-  if pidof dnscrypt-proxy >/dev/null 2>&1; then
-    log "DNSCRYPT: process exists, but :${port} not visible; restarting"
-    log "DNSCRYPT: listeners before restart:"
-    who_listens | while IFS= read -r l; do [ -n "$l" ] && log "DNSCRYPT: $l"; done
-    /opt/etc/init.d/S09dnscrypt-proxy2 stop >/dev/null 2>&1 || true
-    killall dnscrypt-proxy >/dev/null 2>&1 || true
-    sleep 1
-  fi
-
-  log "DNSCRYPT: starting via init.d (capturing to $STARTLOG)"
-  sh -x /opt/etc/init.d/S09dnscrypt-proxy2 start >>"$STARTLOG" 2>&1 || true
-
-  i=0
-  while [ "$i" -lt 20 ]; do
-    if is_listening; then
-      log "DNSCRYPT: up after ${i}s"
-      set -e
-      return 0
-    fi
-    sleep 1
-    i=$((i+1))
-  done
-
-  log "DNSCRYPT: still NOT listening on :${port} after ${i}s"
-  log "DNSCRYPT: listeners now:"
-  who_listens | while IFS= read -r l; do [ -n "$l" ] && log "DNSCRYPT: $l"; done
-  log "DNSCRYPT: startlog tail:"
-  tail -n 80 "$STARTLOG" 2>/dev/null | while IFS= read -r l; do log "DNSCRYPT-LOG: $l"; done
-
-  set -e
-  return 1
-}
-
-cleanup() {
-  # Всегда снимаем lock и восстанавливаем DNS-шифрование (best-effort).
-  rm -rf "$LOCK_DIR" 2>/dev/null || true
-  force_crypt_on || true
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 esc_sed() { printf '%s' "$1" | sed 's/[\/&\\]/\\&/g'; }
 
 sha_full() { sha256sum "$1" | awk '{print $1}'; }
 
-sha_show4() {
-  h="$1"
-  printf "%s…%s" "$(printf '%s' "$h" | cut -c1-4)" "$(printf '%s' "$h" | cut -c61-64)"
-}
+count_lines() { wc -l <"$1" | tr -d ' '; }
 
-normalize_list() {
-  in="$1"; out="$2"
-  sed 's/\r$//' "$in" \
-    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-    | sed '/^$/d' \
-    | sort -u > "$out"
-}
-
-download_with_retry() {
-  url="$1"; out="$2"
-  n=1
-  while [ "$n" -le "$RETRY_COUNT" ]; do
-    curl -fsSL --max-time "$CURL_TIMEOUT" "$PING_URL" >/dev/null 2>&1 || true
-    if curl -fsSL --max-time "$CURL_TIMEOUT" "$url" -o "$out"; then
-      return 0
-    fi
-    log "download retry $n/$RETRY_COUNT failed"
-    n=$((n+1))
-    sleep "$RETRY_DELAY"
-  done
-  return 1
-}
-
+# -------------------------
+# Telegram
+# -------------------------
 tg_send() {
   msg="$1"
-
-  if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-    log "TG: skip (no token/chat_id)"
-    return 0
-  fi
-  # KVAS/DNS: перед отправкой в TG принудительно включаем DNS-шифрование и ждём восстановления резолва.
-  force_crypt_on
-
-t=0
-while [ "$t" -lt 30 ]; do
-  nslookup api.telegram.org >/dev/null 2>&1 && break
-  sleep 1
-  t=$((t+1))
-done
-
-if nslookup api.telegram.org >/dev/null 2>&1; then
-  log "DNS: ok after ${t}s"
-else
-  log "DNS: still broken after ${t}s, trying fallback resolvers for TG"
-  fallback=""
-  nslookup api.telegram.org 1.1.1.1 >/dev/null 2>&1 && fallback="1.1.1.1"
-  [ -z "$fallback" ] && nslookup api.telegram.org 8.8.8.8 >/dev/null 2>&1 && fallback="8.8.8.8"
-
-  if [ -n "$fallback" ]; then
-    TG_RESOLV="/tmp/kvas-sync.tg-resolv.conf"
-    printf "nameserver %s\n" "$fallback" > "$TG_RESOLV"
-    RESOLV_CONF="$TG_RESOLV"
-    export RESOLV_CONF
-    log "DNS: using fallback nameserver ${fallback} via RESOLV_CONF=${TG_RESOLV} for TG curl"
-  else
-    log "DNS: fallback resolvers also failed"
-  fi
-fi
-
-  # Для Entware: иногда curl берёт не тот resolv.conf
-  if [ -f /opt/etc/resolv.conf ]; then
-    RESOLV_CONF="/opt/etc/resolv.conf"
-    export RESOLV_CONF
-  fi
-
-  # После чистой установки сеть/DNS могут подняться не сразу → ретраи + warm-up
-# Для надёжной отправки: пытаемся получить IP Telegram через публичный DNS
-# и использовать curl --resolve (обход локально сломанного DNS).
-TG_IP="$(nslookup api.telegram.org 1.1.1.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -n 1)"
-if [ -n "$TG_IP" ]; then
-  TG_RESOLVE_OPT="--resolve api.telegram.org:443:${TG_IP}"
-  log "TG: using --resolve api.telegram.org -> $TG_IP"
-else
-  TG_RESOLVE_OPT=""
-fi
-
-tries=5
-  delay=6
+  [ -n "${BOT_TOKEN:-}" ] || { log "TG: BOT_TOKEN not set, skip"; return 0; }
+  [ -n "${CHAT_ID:-}" ] || { log "TG: CHAT_ID not set, skip"; return 0; }
 
   i=1
-  while [ "$i" -le "$tries" ]; do
-    nslookup api.telegram.org >/dev/null 2>&1 || true
-
-    resp="$(curl -sS -m 20 $TG_RESOLVE_OPT -X POST \
+  while [ "$i" -le "${TG_TRIES:-3}" ]; do
+    resp="$(curl -sS -m 20 -X POST \
       "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
       -d "chat_id=${CHAT_ID}" \
       --data-urlencode "text=${msg}" 2>&1)" && {
@@ -268,26 +87,22 @@ tries=5
         return 0
       }
 
-    log "TG: send failed (try ${i}/${tries}): $resp"
+    log "TG: send failed (try ${i}/${TG_TRIES:-3}): $resp"
     i=$((i+1))
-    sleep "$delay"
+    sleep "${TG_DELAY:-3}"
   done
-
   return 0
 }
 
 render_and_send() {
   tpl="$1"
   tmp="$WORKDIR/tmp/tg_msg.txt"
+  cp -f "$tpl" "$tmp" 2>/dev/null || { log "TG: template not found: $tpl"; return 0; }
 
-  [ -f "$tpl" ] || { log "TPL missing: $tpl"; return 0; }
-
-  cp "$tpl" "$tmp"
-
-  R_ESC="$(esc_sed "$ROUTER_NAME")"
-  L_ESC="$(esc_sed "$LINES")"
-  S_ESC="$(esc_sed "$SHA_SHOW")"
-  D_ESC="$(esc_sed "$DT")"
+  R_ESC="$(esc_sed "${ROUTER_NAME}")"
+  L_ESC="$(esc_sed "${LINES:-}")"
+  S_ESC="$(esc_sed "${SHA:-}")"
+  D_ESC="$(esc_sed "${DT:-$(dt_ru)}")"
   E1_ESC="$(esc_sed "${ERR_TITLE:-}")"
   E2_ESC="$(esc_sed "${ERR_LINES:-}")"
 
@@ -298,30 +113,98 @@ render_and_send() {
     -e "s/{{DT}}/${D_ESC}/g" \
     -e "s/{{ERR_TITLE}}/${E1_ESC}/g" \
     -e "s/{{ERR_LINES}}/${E2_ESC}/g" \
-    "$tmp" || true
+    "$tmp" 2>/dev/null || true
 
   tg_send "$(cat "$tmp")"
 }
 
-[ -n "$LIST_URL" ] || { log "LIST_URL empty"; exit 1; }
+# -------------------------
+# Lock
+# -------------------------
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$$" >"$LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+  fi
 
-mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+  # stale lock cleanup
+  if [ -f "$LOCK_DIR/pid" ]; then
+    oldpid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR" 2>/dev/null || true
+      mkdir "$LOCK_DIR" 2>/dev/null || return 1
+      echo "$$" >"$LOCK_DIR/pid" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+cleanup() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
+
+# -------------------------
+# Purge (only if list changed)
+# -------------------------
+purge_kvas_state() {
+  # In your environment KVAS provides 'kvas purge' and ipset table is 'unblock'
+  log "PURGE: running 'kvas purge'"
+  "$KVAS" purge </dev/null >/dev/null 2>&1 || true
+}
+
+# -------------------------
+# Normalize list
+# -------------------------
+normalize_list() {
+  in="$1"
+  out="$2"
+  # remove comments/blank, trim, lowercase
+  sed \
+    -e 's/\r$//' \
+    -e 's/[ \t]\+$//' \
+    -e 's/^[ \t]\+//' \
+    -e '/^$/d' \
+    -e '/^[#;]/d' \
+    "$in" \
+  | tr '[:upper:]' '[:lower:]' \
+  > "$out"
+}
+
+# -------------------------
+# Main
+# -------------------------
 log "start"
-DT="$(dt_ru)"
 
-rm -f "$NEW_RAW" "$NEW_NORM"
+[ -x "$KVAS" ] || die "KVAS binary not found: $KVAS"
+[ -n "$LIST_URL" ] || die "LIST_URL is empty (check conf)"
 
-if ! download_with_retry "$LIST_URL" "$NEW_RAW"; then
-  log "download failed"
+if ! acquire_lock; then
+  die "another run is in progress (lock: $LOCK_DIR)"
+fi
+
+# download with retries
+i=1
+ok=0
+while [ "$i" -le "$RETRY_COUNT" ]; do
+  log "download try ${i}/${RETRY_COUNT}"
+  if curl -fsSL -m "$CURL_TIMEOUT" "$LIST_URL" -o "$NEW_RAW" 2>/dev/null; then
+    ok=1
+    break
+  fi
+  i=$((i+1))
+  sleep "$RETRY_DELAY"
+done
+
+if [ "$ok" -ne 1 ]; then
   ERR_TITLE="Ошибка загрузки"
   ERR_LINES="• download failed"
   render_and_send "$TPL_ERR"
   exit 1
 fi
 
+# HTML guard
 head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
-  log "download returned HTML"
   ERR_TITLE="Ошибка загрузки"
   ERR_LINES="• HTML вместо списка"
   render_and_send "$TPL_ERR"
@@ -330,61 +213,50 @@ head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
 
 normalize_list "$NEW_RAW" "$NEW_NORM"
 
-LINES="$(wc -l < "$NEW_NORM" | tr -d ' ')"
-SHA="$(sha_full "$NEW_NORM")"
-SHA_SHOW="$(sha_show4 "$SHA")"
-
+LINES="$(count_lines "$NEW_NORM" 2>/dev/null || echo 0)"
 if [ "$LINES" -lt "$MIN_LINES" ] || [ "$LINES" -gt "$MAX_LINES" ]; then
-  log "lines out of bounds: $LINES"
-  ERR_TITLE="Некорректный размер списка"
-  ERR_LINES="• строк: $LINES"
+  ERR_TITLE="Ошибка списка"
+  ERR_LINES="• Некорректное число строк: ${LINES} (ожидалось ${MIN_LINES}-${MAX_LINES})"
   render_and_send "$TPL_ERR"
   exit 1
 fi
 
+SHA="$(sha_full "$NEW_NORM")"
+DT="$(dt_ru)"
+
+# SAME: if hash matches current — no purge, no import
 if [ -f "$CUR_FILE" ]; then
-  SHA_CUR="$(sha_full "$CUR_FILE")"
-else
-  SHA_CUR=""
-fi
-
-if [ -n "$SHA_CUR" ] && [ "$SHA_CUR" = "$SHA" ]; then
-  log "SAME: normalized sha matched"
-  render_and_send "$TPL_SAME"
-  exit 0
-fi
-# --- KVAS pre-import: обновление KVAS и восстановление DNS ---
-if [ -x "$KVAS" ]; then
-  log "KVAS: update (before import)"
-  tmpu="$WORKDIR/tmp/kvas-update.log"
-  : >"$tmpu" 2>/dev/null || true
-  "$KVAS" update </dev/null >"$tmpu" 2>&1 || true
-  while IFS= read -r line; do log "KVAS: $line"; done < "$tmpu" || true
-  # После update KVAS может сбросить DNS: фиксируем шифрование и поднимаем dnscrypt.
-  force_crypt_on
-  ensure_dnscrypt_running 9153 || true
-
-  # Best-effort проверка прикладного резолва (важно для TG)
-  if nslookup api.telegram.org >/dev/null 2>&1; then
-    log "DNS: resolver ok (api.telegram.org)"
-  else
-    log "DNS: resolver still failing (api.telegram.org)"
+  CUR_SHA="$(sha_full "$CUR_FILE" 2>/dev/null || echo "")"
+  if [ -n "$CUR_SHA" ] && [ "$CUR_SHA" = "$SHA" ]; then
+    log "SAME: list unchanged (sha=$SHA, lines=$LINES)"
+    render_and_send "$TPL_SAME"
+    exit 0
   fi
-else
-  log "KVAS: binary not found at $KVAS (PATH=$PATH)"
-fi
-# -------------------------------------------------------
-
-if timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD '$NEW_NORM'"; then
-  cp "$NEW_NORM" "$CUR_FILE"  log "IMPORT OK"
-  # После импорта KVAS/перезапусков DNS иногда "сбрасывается" crypt — фиксируем ещё раз перед TG.
-  force_crypt_on || true
-  render_and_send "$TPL_OK"
-else
-  log "IMPORT FAILED"
-  ERR_TITLE="Ошибка импорта"
-  ERR_LINES="• команда: $IMPORT_CMD"
-  render_and_send "$TPL_ERR"
 fi
 
+# CHANGED: purge + import
+purge_kvas_state
+
+log "IMPORT: running '$IMPORT_CMD' (timeout=${IMPORT_TIMEOUT}s)"
+if need_cmd timeout; then
+  timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1 || {
+    ERR_TITLE="Ошибка импорта"
+    ERR_LINES="• kvas import failed (timeout/exit)"
+    render_and_send "$TPL_ERR"
+    exit 1
+  }
+else
+  sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1 || {
+    ERR_TITLE="Ошибка импорта"
+    ERR_LINES="• kvas import failed"
+    render_and_send "$TPL_ERR"
+    exit 1
+  }
+fi
+
+# Save current list
+cp -f "$NEW_NORM" "$CUR_FILE" 2>/dev/null || true
+
+log "OK: imported new list (sha=$SHA, lines=$LINES)"
+render_and_send "$TPL_OK"
 exit 0
