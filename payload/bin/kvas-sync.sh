@@ -4,14 +4,11 @@ set -eu
 export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # =========================
-# KVAS-SYNC Router Agent (weekly, v8)
-# Goals:
-# - NO: kvas update
-# - NO: kvas crypt on/off
-# - YES: Telegram notifications (OK / SAME / ERR) using existing templates
-# - If list SAME: do nothing (unless ipset overflow protection triggers rebuild)
-# - If list CHANGED: kvas import + rebuild ipset (flush unblock + run ipset.kvas)
-# - Always avoid race with KVAS cron.5mins/ipset.kvas by pausing Entware cron around rebuild.
+# KVAS-SYNC Router Agent (weekly, v9)
+# Fixes vs v8:
+# - Stop Entware cron + kill KVAS ipset jobs BEFORE kvas import (import was hanging due to race)
+# - Capture kvas import and ipset.kvas output to logs for diagnosis
+# - Restore DNS encryption state if it was ON before run (best-effort, no forcing)
 # =========================
 
 KVAS="/opt/bin/kvas"
@@ -40,15 +37,14 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 : "${RETRY_DELAY:=8}"
 : "${IMPORT_TIMEOUT:=2700}"
 
-# KVAS ipset set name (from your router output)
 : "${KVAS_IPSET_NAME:=unblock}"
-
-# Overflow protection: rebuild ipset even if list SAME when entry count exceeds this threshold
 : "${IPSET_OVERFLOW_THRESHOLD:=60000}"
 
-# Cron pause around rebuild (seconds)
 : "${CRON_PAUSE_SLEEP:=3}"
 : "${POST_REBUILD_SLEEP:=2}"
+
+# Optional: restore crypt state if it was ON before run (default: yes)
+: "${RESTORE_CRYPT_STATE:=1}"
 
 TPL_OK="$WORKDIR/conf/tg_ok.tpl"
 TPL_SAME="$WORKDIR/conf/tg_same.tpl"
@@ -61,6 +57,9 @@ LOCK_DIR="$STATE_DIR/import.lock"
 NEW_RAW="$STATE_DIR/inside-kvas.new.raw.lst"
 NEW_NORM="$STATE_DIR/inside-kvas.new.norm.lst"
 CUR_FILE="$STATE_DIR/inside-kvas.cur.lst"
+
+IMPORT_LOG="$LOGDIR/kvas-import.log"
+IPSET_LOG="$LOGDIR/ipset-rebuild.log"
 
 ts()    { date '+%Y-%m-%d %H:%M:%S'; }
 dt_ru() { date '+%d.%m.%Y %H:%M:%S МСК'; }
@@ -140,7 +139,6 @@ acquire_lock() {
     return 0
   fi
 
-  # stale lock cleanup
   if [ -f "$LOCK_DIR/pid" ]; then
     oldpid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
     if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
@@ -154,11 +152,24 @@ acquire_lock() {
   return 1
 }
 
-cleanup() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+# restore cron + (optionally) crypt state on exit
+CRON_INIT=""
+CRYPT_WAS_ON=0
+cleanup() {
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+
+  if [ -n "$CRON_INIT" ]; then
+    "$CRON_INIT" start >/dev/null 2>&1 || true
+  fi
+
+  if [ "${RESTORE_CRYPT_STATE:-1}" = "1" ] && [ "$CRYPT_WAS_ON" -eq 1 ]; then
+    "$KVAS" crypt on </dev/null >/dev/null 2>&1 || true
+  fi
+}
 trap cleanup EXIT INT TERM
 
 # -------------------------
-# Cron control (Entware) to avoid race with /opt/etc/cron.5mins/ipset.kvas
+# Cron control (Entware)
 # -------------------------
 find_cron_init() {
   for f in /opt/etc/init.d/*cron* /opt/etc/init.d/*crond*; do
@@ -168,8 +179,6 @@ find_cron_init() {
   done
   return 1
 }
-
-CRON_INIT=""
 
 stop_entware_cron() {
   CRON_INIT="$(find_cron_init 2>/dev/null || true)"
@@ -201,7 +210,7 @@ kill_kvas_ipset_jobs() {
   for pat in "/opt/etc/cron.5mins/ipset.kvas" "/opt/apps/kvas/bin/main/ipset"; do
     pids="$(ps | grep -F "$pat" | grep -v grep | awk '{print $1}' || true)"
     if [ -n "$pids" ]; then
-      log "CRON: killing running job(s) for $pat: $pids"
+      log "CRON: killing running job(s) for $pat: $(echo "$pids" | tr '\n' ' ')"
       for p in $pids; do kill "$p" >/dev/null 2>&1 || true; done
       sleep 1
       for p in $pids; do kill -9 "$p" >/dev/null 2>&1 || true; done
@@ -216,32 +225,36 @@ ipset_count() {
   ipset list "$KVAS_IPSET_NAME" 2>/dev/null | grep -E '^[[:space:]]*[0-9]' | wc -l | tr -d ' '
 }
 
+detect_crypt_state() {
+  "$KVAS" crypt 2>/dev/null | grep -q "ПОДКЛЮЧЕНО"
+}
+
+import_list() {
+  log "IMPORT: running '$IMPORT_CMD' (timeout=${IMPORT_TIMEOUT}s) -> $IMPORT_LOG"
+  : >"$IMPORT_LOG" 2>/dev/null || true
+  if need_cmd timeout; then
+    timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD \"$NEW_NORM\"" >>"$IMPORT_LOG" 2>&1
+  else
+    sh -c "$IMPORT_CMD \"$NEW_NORM\"" >>"$IMPORT_LOG" 2>&1
+  fi
+  return $?
+}
+
 rebuild_ipset() {
-  stop_entware_cron
-  kill_kvas_ipset_jobs
+  log "IPSET: rebuild start -> $IPSET_LOG"
+  : >"$IPSET_LOG" 2>/dev/null || true
 
   log "IPSET: flush $KVAS_IPSET_NAME"
-  ipset flush "$KVAS_IPSET_NAME" >/dev/null 2>&1 || true
+  ipset flush "$KVAS_IPSET_NAME" >>"$IPSET_LOG" 2>&1 || true
 
   if [ -x /opt/etc/cron.5mins/ipset.kvas ]; then
     log "IPSET: rebuild via /opt/etc/cron.5mins/ipset.kvas start"
-    /opt/etc/cron.5mins/ipset.kvas start >/dev/null 2>&1 || true
+    /opt/etc/cron.5mins/ipset.kvas start >>"$IPSET_LOG" 2>&1 || true
   else
     log "IPSET: ipset.kvas not found at /opt/etc/cron.5mins/ipset.kvas"
   fi
 
-  start_entware_cron
   sleep "$POST_REBUILD_SLEEP"
-}
-
-import_list() {
-  log "IMPORT: running '$IMPORT_CMD' (timeout=${IMPORT_TIMEOUT}s)"
-  if need_cmd timeout; then
-    timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1
-  else
-    sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1
-  fi
-  return $?
 }
 
 # -------------------------
@@ -269,7 +282,13 @@ log "start"
 [ -x "$KVAS" ] || die "KVAS binary not found: $KVAS"
 [ -n "$LIST_URL" ] || die "LIST_URL is empty (check conf)"
 need_cmd ipset || die "ipset not found"
-[ -x /opt/etc/cron.5mins/ipset.kvas ] || log "WARN: /opt/etc/cron.5mins/ipset.kvas not executable"
+
+if [ "${RESTORE_CRYPT_STATE:-1}" = "1" ] && detect_crypt_state; then
+  CRYPT_WAS_ON=1
+  log "CRYPT: was ON before run; will restore at end"
+else
+  log "CRYPT: was OFF before run (or restore disabled)"
+fi
 
 if ! acquire_lock; then
   die "another run is in progress (lock: $LOCK_DIR)"
@@ -295,7 +314,6 @@ if [ "$ok" -ne 1 ]; then
   exit 1
 fi
 
-# HTML guard
 head -n 2 "$NEW_RAW" | grep -qi '<!doctype\|<html' && {
   ERR_TITLE="Ошибка загрузки"
   ERR_LINES="• HTML вместо списка"
@@ -337,6 +355,10 @@ if [ "$LIST_CHANGED" -eq 0 ] && [ "$OVERFLOW_REBUILD" -eq 0 ]; then
   exit 0
 fi
 
+# Critical section: stop cron + kill KVAS ipset jobs BEFORE import and rebuild
+stop_entware_cron
+kill_kvas_ipset_jobs
+
 if [ "$LIST_CHANGED" -eq 1 ]; then
   if import_list; then
     cp -f "$NEW_NORM" "$CUR_FILE" 2>/dev/null || true
@@ -344,7 +366,7 @@ if [ "$LIST_CHANGED" -eq 1 ]; then
   else
     rc=$?
     ERR_TITLE="Ошибка импорта"
-    ERR_LINES="• kvas import failed (exit=${rc})"
+    ERR_LINES="• kvas import failed (exit=${rc}) • see $IMPORT_LOG"
     render_and_send "$TPL_ERR"
     exit 1
   fi
@@ -353,6 +375,7 @@ else
 fi
 
 rebuild_ipset
+start_entware_cron
 
 CNT2="$(ipset_count || echo 0)"
 log "IPSET: entries after rebuild=${CNT2}"
