@@ -4,11 +4,14 @@ set -eu
 export PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # =========================
-# KVAS-SYNC Router Agent (weekly)
+# KVAS-SYNC Router Agent (weekly, v8)
+# Goals:
 # - NO: kvas update
 # - NO: kvas crypt on/off
-# - YES: weekly purge of KVAS state when list CHANGED (kvas purge)
-# - YES: Telegram notifications (OK / SAME / ERR)
+# - YES: Telegram notifications (OK / SAME / ERR) using existing templates
+# - If list SAME: do nothing (unless ipset overflow protection triggers rebuild)
+# - If list CHANGED: kvas import + rebuild ipset (flush unblock + run ipset.kvas)
+# - Always avoid race with KVAS cron.5mins/ipset.kvas by pausing Entware cron around rebuild.
 # =========================
 
 KVAS="/opt/bin/kvas"
@@ -36,6 +39,16 @@ SECRETS="/opt/kvas-sync/conf/secrets.conf"
 : "${RETRY_COUNT:=3}"
 : "${RETRY_DELAY:=8}"
 : "${IMPORT_TIMEOUT:=2700}"
+
+# KVAS ipset set name (from your router output)
+: "${KVAS_IPSET_NAME:=unblock}"
+
+# Overflow protection: rebuild ipset even if list SAME when entry count exceeds this threshold
+: "${IPSET_OVERFLOW_THRESHOLD:=60000}"
+
+# Cron pause around rebuild (seconds)
+: "${CRON_PAUSE_SLEEP:=3}"
+: "${POST_REBUILD_SLEEP:=2}"
 
 TPL_OK="$WORKDIR/conf/tg_ok.tpl"
 TPL_SAME="$WORKDIR/conf/tg_same.tpl"
@@ -145,12 +158,90 @@ cleanup() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 # -------------------------
-# Purge (only if list changed)
+# Cron control (Entware) to avoid race with /opt/etc/cron.5mins/ipset.kvas
 # -------------------------
-purge_kvas_state() {
-  # In your environment KVAS provides 'kvas purge' and ipset table is 'unblock'
-  log "PURGE: running 'kvas purge'"
-  "$KVAS" purge </dev/null >/dev/null 2>&1 || true
+find_cron_init() {
+  for f in /opt/etc/init.d/*cron* /opt/etc/init.d/*crond*; do
+    [ -x "$f" ] || continue
+    echo "$f"
+    return 0
+  done
+  return 1
+}
+
+CRON_INIT=""
+
+stop_entware_cron() {
+  CRON_INIT="$(find_cron_init 2>/dev/null || true)"
+  if [ -n "$CRON_INIT" ]; then
+    log "CRON: stopping via $CRON_INIT stop"
+    "$CRON_INIT" stop >/dev/null 2>&1 || true
+  else
+    log "CRON: init script not found, killing crond"
+    killall crond >/dev/null 2>&1 || true
+    killall /opt/sbin/crond >/dev/null 2>&1 || true
+  fi
+  sleep "$CRON_PAUSE_SLEEP"
+}
+
+start_entware_cron() {
+  if [ -z "$CRON_INIT" ]; then
+    CRON_INIT="$(find_cron_init 2>/dev/null || true)"
+  fi
+  if [ -n "$CRON_INIT" ]; then
+    log "CRON: starting via $CRON_INIT start"
+    "$CRON_INIT" start >/dev/null 2>&1 || true
+  else
+    log "CRON: init script not found, starting /opt/sbin/crond"
+    /opt/sbin/crond >/dev/null 2>&1 || true
+  fi
+}
+
+kill_kvas_ipset_jobs() {
+  for pat in "/opt/etc/cron.5mins/ipset.kvas" "/opt/apps/kvas/bin/main/ipset"; do
+    pids="$(ps | grep -F "$pat" | grep -v grep | awk '{print $1}' || true)"
+    if [ -n "$pids" ]; then
+      log "CRON: killing running job(s) for $pat: $pids"
+      for p in $pids; do kill "$p" >/dev/null 2>&1 || true; done
+      sleep 1
+      for p in $pids; do kill -9 "$p" >/dev/null 2>&1 || true; done
+    fi
+  done
+}
+
+# -------------------------
+# KVAS helpers
+# -------------------------
+ipset_count() {
+  ipset list "$KVAS_IPSET_NAME" 2>/dev/null | grep -E '^[[:space:]]*[0-9]' | wc -l | tr -d ' '
+}
+
+rebuild_ipset() {
+  stop_entware_cron
+  kill_kvas_ipset_jobs
+
+  log "IPSET: flush $KVAS_IPSET_NAME"
+  ipset flush "$KVAS_IPSET_NAME" >/dev/null 2>&1 || true
+
+  if [ -x /opt/etc/cron.5mins/ipset.kvas ]; then
+    log "IPSET: rebuild via /opt/etc/cron.5mins/ipset.kvas start"
+    /opt/etc/cron.5mins/ipset.kvas start >/dev/null 2>&1 || true
+  else
+    log "IPSET: ipset.kvas not found at /opt/etc/cron.5mins/ipset.kvas"
+  fi
+
+  start_entware_cron
+  sleep "$POST_REBUILD_SLEEP"
+}
+
+import_list() {
+  log "IMPORT: running '$IMPORT_CMD' (timeout=${IMPORT_TIMEOUT}s)"
+  if need_cmd timeout; then
+    timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1
+  else
+    sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1
+  fi
+  return $?
 }
 
 # -------------------------
@@ -159,7 +250,6 @@ purge_kvas_state() {
 normalize_list() {
   in="$1"
   out="$2"
-  # remove comments/blank, trim, lowercase
   sed \
     -e 's/\r$//' \
     -e 's/[ \t]\+$//' \
@@ -178,6 +268,8 @@ log "start"
 
 [ -x "$KVAS" ] || die "KVAS binary not found: $KVAS"
 [ -n "$LIST_URL" ] || die "LIST_URL is empty (check conf)"
+need_cmd ipset || die "ipset not found"
+[ -x /opt/etc/cron.5mins/ipset.kvas ] || log "WARN: /opt/etc/cron.5mins/ipset.kvas not executable"
 
 if ! acquire_lock; then
   die "another run is in progress (lock: $LOCK_DIR)"
@@ -224,39 +316,47 @@ fi
 SHA="$(sha_full "$NEW_NORM")"
 DT="$(dt_ru)"
 
-# SAME: if hash matches current — no purge, no import
+LIST_CHANGED=1
 if [ -f "$CUR_FILE" ]; then
   CUR_SHA="$(sha_full "$CUR_FILE" 2>/dev/null || echo "")"
   if [ -n "$CUR_SHA" ] && [ "$CUR_SHA" = "$SHA" ]; then
-    log "SAME: list unchanged (sha=$SHA, lines=$LINES)"
-    render_and_send "$TPL_SAME"
-    exit 0
+    LIST_CHANGED=0
   fi
 fi
 
-# CHANGED: purge + import
-purge_kvas_state
-
-log "IMPORT: running '$IMPORT_CMD' (timeout=${IMPORT_TIMEOUT}s)"
-if need_cmd timeout; then
-  timeout "$IMPORT_TIMEOUT" sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1 || {
-    ERR_TITLE="Ошибка импорта"
-    ERR_LINES="• kvas import failed (timeout/exit)"
-    render_and_send "$TPL_ERR"
-    exit 1
-  }
-else
-  sh -c "$IMPORT_CMD \"$NEW_NORM\"" >/dev/null 2>&1 || {
-    ERR_TITLE="Ошибка импорта"
-    ERR_LINES="• kvas import failed"
-    render_and_send "$TPL_ERR"
-    exit 1
-  }
+CNT="$(ipset_count || echo 0)"
+log "IPSET: current entries=${CNT} (threshold=${IPSET_OVERFLOW_THRESHOLD})"
+OVERFLOW_REBUILD=0
+if [ "$CNT" -ge "$IPSET_OVERFLOW_THRESHOLD" ]; then
+  OVERFLOW_REBUILD=1
 fi
 
-# Save current list
-cp -f "$NEW_NORM" "$CUR_FILE" 2>/dev/null || true
+if [ "$LIST_CHANGED" -eq 0 ] && [ "$OVERFLOW_REBUILD" -eq 0 ]; then
+  log "SAME: list unchanged and no overflow (sha=$SHA, lines=$LINES)"
+  render_and_send "$TPL_SAME"
+  exit 0
+fi
 
-log "OK: imported new list (sha=$SHA, lines=$LINES)"
+if [ "$LIST_CHANGED" -eq 1 ]; then
+  if import_list; then
+    cp -f "$NEW_NORM" "$CUR_FILE" 2>/dev/null || true
+    log "IMPORT: done"
+  else
+    rc=$?
+    ERR_TITLE="Ошибка импорта"
+    ERR_LINES="• kvas import failed (exit=${rc})"
+    render_and_send "$TPL_ERR"
+    exit 1
+  fi
+else
+  log "SAME: list unchanged, but overflow protection requires rebuild"
+fi
+
+rebuild_ipset
+
+CNT2="$(ipset_count || echo 0)"
+log "IPSET: entries after rebuild=${CNT2}"
+
+log "OK: list sha=$SHA, lines=$LINES, ipset=${CNT2}"
 render_and_send "$TPL_OK"
 exit 0
